@@ -1,0 +1,36 @@
+# ── Core Data ──────────────────────────────────────────────────────────────
+numpy>=1.26
+pandas>=2.0
+pyarrow                  # fast parquet I/O
+
+# ── Machine Learning ────────────────────────────────────────────────────────
+lightgbm>=4.3
+scikit-learn>=1.4
+catboost                 # optional, drop if not used
+
+# ── Hyperparameter Tuning ───────────────────────────────────────────────────
+optuna>=3.6
+
+# ── Explainability ──────────────────────────────────────────────────────────
+shap>=0.45
+
+# ── Backtesting ─────────────────────────────────────────────────────────────
+vectorbt>=0.26
+
+# ── Visualization ───────────────────────────────────────────────────────────
+matplotlib>=3.8
+seaborn
+plotly
+
+# ── Statistics / Finance ────────────────────────────────────────────────────
+statsmodels>=0.14
+scipy>=1.13
+
+# ── Data Fetching ───────────────────────────────────────────────────────────
+yfinance>=0.2
+
+# ── Utilities ───────────────────────────────────────────────────────────────
+tqdm
+joblib
+python-dateutil
+pandas-ta
