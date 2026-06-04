@@ -15,6 +15,15 @@ Walk-forward LightGBM 訓練模組（FinLab 新專案版）。
     - 沿用時改呼叫 collect_oof_prob（只跑 CV，不做 Optuna）
     - metrics.json 新增 hyperparams_tuned 欄位標記是否有重新 tune
 
+    [2026 修正] CV 時間軸 bug：
+    - 問題：_preprocess_window 以 ["證券代碼","年月日"] 排序（stock-major），
+            train_df 沿用該順序丟進 TimeSeriesSplit，導致 CV 折實際在「按股票
+            分塊」而非「按時間切」（驗證集 ~99.8% 為 train 未見股票）。
+    - 修正：_run_window 在切 X/y/weight 前，先將 train_df / test_df 依「年月日」
+            排序並 reset_index；並把 dates 傳入 tune_lgb / collect_oof_prob，
+            由 lgb_utils 以「唯一交易日」為單位切折（見 lgb_utils._make_cv_folds），
+            消除 panel 同日 cross-sectional 邊界外洩。
+
 Walk-forward 規則：
     Windows: (2014,2016), (2015,2017), ..., (2022,2024)
     每個 window：
@@ -248,8 +257,21 @@ class WalkForwardTrainer:
         print(f"  Window 資料形狀: {full_df.shape}")
 
         year_col = full_df["年月日"].dt.year
-        train_df = full_df[year_col.isin(train_years)].copy()
-        test_df  = full_df[year_col == test_year].copy()
+
+        # ── [2026 修正] 切 train / test 後，務必依「年月日」重新排序 ─────
+        # _preprocess_window 回傳的是 stock-major 排序；若沿用該順序，
+        # 下游 TimeSeriesSplit 會變成「按股票分塊」而非「按時間切」。
+        # 這裡顯式 sort by 年月日 + reset_index，還原 CV 所需的時間軸。
+        train_df = (
+            full_df[year_col.isin(train_years)]
+            .sort_values("年月日")
+            .reset_index(drop=True)
+        )
+        test_df = (
+            full_df[year_col == test_year]
+            .sort_values("年月日")
+            .reset_index(drop=True)
+        )
 
         print(
             f"  Train {train_years}: {len(train_df):,} 筆  "
@@ -271,6 +293,9 @@ class WalkForwardTrainer:
         X_test  = test_df[feature_cols].fillna(0)
         y_test  = test_df[self.cfg.target_col]
 
+        # CV 切折依據（傳給 lgb_utils 以唯一交易日為單位切折）
+        train_dates = train_df["年月日"]
+
         train_weight = self._compute_sample_weights(train_df)
 
         # ── 超參數決策 ────────────────────────────────────────
@@ -284,6 +309,7 @@ class WalkForwardTrainer:
                 n_trials      = self.cfg.n_trials,
                 random_state  = self.cfg.random_state,
                 sample_weight = train_weight,
+                dates         = train_dates,
             )
             if self.cfg.freeze_hyperparams:
                 self._frozen_params = best_params
@@ -296,6 +322,7 @@ class WalkForwardTrainer:
                 best_params   = best_params,
                 n_splits      = self.cfg.n_splits,
                 sample_weight = train_weight,
+                dates         = train_dates,
             )
 
         print("  訓練最終模型...")

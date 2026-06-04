@@ -17,11 +17,25 @@ WalkForwardTrainer（model.py）與 DailyTrainer（daily_model.py）
     - 超參數凍結模式下，跳過 Optuna，只用固定參數跑 CV 收集 OOF prob
     - 供 find_threshold 使用，耗時約為 tune_lgb 的 1/n_trials
 
+    [2026 修正] CV 切折以「唯一交易日」為單位（date-aware）：
+    - 問題①：上游 train_df 若為 stock-major 排序，row-based TimeSeriesSplit
+              會退化成「按股票分塊」（已於 model.py 端先 sort by 年月日 修正）。
+    - 問題②：即使依日期排序，panel 同一交易日有上千檔股票，row-based 切折
+              仍可能把「同一天」拆在 train/valid 邊界兩側 → 同日 cross-sectional
+              外洩。本版改為以唯一交易日為切分單位（_make_cv_folds），確保同一天
+              的所有股票完整落在同一側。
+    - 問題③：TimeSeriesSplit 最早一段樣本永遠不在任何 valid fold，舊版 OOF 以
+              0 初始化，使這些列被 find_threshold 當成「預測為負」而污染門檻。
+              本版 OOF 改以 NaN 初始化，find_threshold 自動略過未預測列。
+
+    向後相容：dates 為 None 時退回傳統 row-based TimeSeriesSplit
+              （DailyTrainer 若未傳 dates，行為與舊版一致）。
+
 公開函式：
     tune_lgb          Optuna TPE 調參 + OOF prob 收集
     collect_oof_prob  固定超參數下只收集 OOF prob（凍結模式用）
     train_final_lgb   最終模型訓練（全量 X_train）
-    find_threshold    OOF F1 最佳 threshold 搜尋
+    find_threshold    OOF F1 最佳 threshold 搜尋（自動略過 NaN）
     build_imp_df      特徵重要性 DataFrame（gain）
 
 作者：Daniel Huang
@@ -78,6 +92,58 @@ def _suggest_params(trial: optuna.Trial) -> dict:
 
 
 # ============================================================
+#  CV 切折（date-aware）
+# ============================================================
+
+def _make_cv_folds(
+    X:        pd.DataFrame,
+    n_splits: int,
+    dates:    pd.Series | np.ndarray | None = None,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    產生 [(train_pos, valid_pos), ...] 折清單（expanding window）。
+
+    dates 提供時（建議）：
+        以「唯一交易日」為切分單位，先對 unique dates 跑 TimeSeriesSplit，
+        再映回 row 位置。確保同一交易日的所有股票完整落在 train 或 valid
+        同一側，消除 panel 同日 cross-sectional 邊界外洩。
+
+    dates 為 None：
+        退回傳統 row-based TimeSeriesSplit（向後相容）。
+
+    Parameters
+    ----------
+    X        : 訓練特徵（僅用於 row 數 / row-based fallback）
+    n_splits : 摺數
+    dates    : 與 X 逐列對齊的日期序列（model.py 傳入 train_df["年月日"]）
+
+    Returns
+    -------
+    list[(train_pos, valid_pos)]  ── 皆為 positional int 索引（供 .iloc 使用）
+    """
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+
+    if dates is None:
+        return list(tscv.split(X))
+
+    d = pd.to_datetime(pd.Series(np.asarray(dates))).reset_index(drop=True)
+    uniq = np.sort(d.unique())
+
+    # 唯一日期數不足以切 n_splits 折 → 退回 row-based
+    if len(uniq) <= n_splits:
+        return list(tscv.split(X))
+
+    pos  = np.arange(len(d))
+    d_np = d.to_numpy()
+    folds = []
+    for tr_d_idx, va_d_idx in tscv.split(uniq):
+        tr_mask = np.isin(d_np, uniq[tr_d_idx])
+        va_mask = np.isin(d_np, uniq[va_d_idx])
+        folds.append((pos[tr_mask], pos[va_mask]))
+    return folds
+
+
+# ============================================================
 #  公開函式
 # ============================================================
 
@@ -88,9 +154,10 @@ def tune_lgb(
     n_trials:      int,
     random_state:  int,
     sample_weight: np.ndarray | None = None,
+    dates:         pd.Series | np.ndarray | None = None,
 ) -> tuple[dict, np.ndarray]:
     """
-    Optuna TPE 調參 + 最佳參數 OOF prob 收集（TimeSeriesSplit）。
+    Optuna TPE 調參 + 最佳參數 OOF prob 收集（date-aware CV）。
 
     最佳參數確定後，只再跑一輪 CV 收集 OOF prob，
     供 find_threshold 使用，不額外增加訓練負擔。
@@ -98,23 +165,25 @@ def tune_lgb(
     Parameters
     ----------
     X_train, y_train : 訓練集
-    n_splits         : TimeSeriesSplit 摺數
+    n_splits         : 摺數
     n_trials         : Optuna trial 數
     random_state     : 隨機種子
     sample_weight    : 可選 shape=(n_train,)（inverse-vol weight 等）
+    dates            : 可選，與 X_train 逐列對齊的日期序列；
+                       提供時以唯一交易日為單位切折（建議）
 
     Returns
     -------
     best_params : dict         ── Optuna 最佳超參數（不含 base params）
-    oof_prob    : np.ndarray   ── OOF 預測機率，與 y_train 等長
+    oof_prob    : np.ndarray   ── OOF 預測機率（未被任何 valid fold 命中者為 NaN）
     """
-    tscv = TimeSeriesSplit(n_splits=n_splits)
+    cv_folds = _make_cv_folds(X_train, n_splits, dates)
 
     # ── Optuna ──────────────────────────────────────────────
     def objective(trial: optuna.Trial) -> float:
         params = {**_LGB_BASE_PARAMS, **_suggest_params(trial)}
         fold_losses = []
-        for tr_idx, va_idx in tscv.split(X_train):
+        for tr_idx, va_idx in cv_folds:
             w_tr = sample_weight[tr_idx] if sample_weight is not None else None
             w_va = sample_weight[va_idx] if sample_weight is not None else None
             m = lgb.train(
@@ -146,7 +215,9 @@ def tune_lgb(
     print(f"  Best CV log-loss: {study.best_value:.6f}")
 
     # ── 最佳參數 OOF prob ────────────────────────────────────
-    oof_prob = collect_oof_prob(X_train, y_train, best_params, n_splits, sample_weight)
+    oof_prob = collect_oof_prob(
+        X_train, y_train, best_params, n_splits, sample_weight, dates
+    )
 
     return best_params, oof_prob
 
@@ -157,9 +228,10 @@ def collect_oof_prob(
     best_params:   dict,
     n_splits:      int,
     sample_weight: np.ndarray | None = None,
+    dates:         pd.Series | np.ndarray | None = None,
 ) -> np.ndarray:
     """
-    固定超參數下，只跑 TimeSeriesSplit CV 收集 OOF prob。
+    固定超參數下，只跑 date-aware CV 收集 OOF prob。
 
     用於超參數凍結模式：跳過 Optuna，直接用 frozen params 評估 threshold，
     耗時約為 tune_lgb 的 1/n_trials。
@@ -168,18 +240,21 @@ def collect_oof_prob(
     ----------
     X_train, y_train : 訓練集
     best_params      : 已凍結的超參數 dict（不含 base params）
-    n_splits         : TimeSeriesSplit 摺數
+    n_splits         : 摺數
     sample_weight    : 可選 shape=(n_train,)
+    dates            : 可選，與 X_train 逐列對齊的日期序列
 
     Returns
     -------
-    oof_prob : np.ndarray  ── OOF 預測機率，與 y_train 等長
+    oof_prob : np.ndarray  ── 與 y_train 等長；
+               最早一段（從不在任何 valid fold）保持 NaN，
+               由 find_threshold 自動略過，避免污染門檻搜尋。
     """
-    tscv     = TimeSeriesSplit(n_splits=n_splits)
+    cv_folds = _make_cv_folds(X_train, n_splits, dates)
     params   = {**_LGB_BASE_PARAMS, **best_params}
-    oof_prob = np.zeros(len(y_train))
+    oof_prob = np.full(len(y_train), np.nan)   # NaN 初始化（非 0）
 
-    for tr_idx, va_idx in tscv.split(X_train):
+    for tr_idx, va_idx in cv_folds:
         w_tr = sample_weight[tr_idx] if sample_weight is not None else None
         m = lgb.train(
             params,
@@ -225,16 +300,30 @@ def find_threshold(y_true: pd.Series, oof_prob: np.ndarray) -> float:
     """
     在 [0.05, 0.70) 以 0.01 為步距搜尋，最大化 OOF F1 的 threshold。
 
+    自動略過 oof_prob 為 NaN 的列（最早一段未被任何 valid fold 命中者），
+    避免將「未預測」誤計為「預測為負」而污染門檻。
+
     Returns
     -------
     float  ── 最佳 threshold（四捨五入至小數點後 2 位）
     """
+    y_true   = np.asarray(y_true)
+    oof_prob = np.asarray(oof_prob, dtype=float)
+
+    mask = ~np.isnan(oof_prob)
+    n_valid = int(mask.sum())
+    if n_valid == 0:
+        print("  ⚠ 無有效 OOF 機率，threshold 退回 0.5")
+        return 0.5
+    y_true   = y_true[mask]
+    oof_prob = oof_prob[mask]
+
     best_thresh, best_f1 = 0.5, 0.0
     for thresh in np.arange(0.05, 0.70, 0.01):
         f1 = f1_score(y_true, (oof_prob >= thresh).astype(int), zero_division=0)
         if f1 > best_f1:
             best_f1, best_thresh = f1, thresh
-    print(f"  Best threshold: {best_thresh:.2f}  (OOF F1={best_f1:.4f})")
+    print(f"  Best threshold: {best_thresh:.2f}  (OOF F1={best_f1:.4f}, n={n_valid:,})")
     return round(float(best_thresh), 2)
 
 
