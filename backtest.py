@@ -73,7 +73,7 @@ EXPERIMENT_DIR    = Path("database/experiment")
 DATABASE_MAKE_DIR = Path("database_make")
 OUTPUT_DIR        = Path("output/backtest")
 N_DECILES         = 10
-COST_BPS          = 0        # 單邊交易成本（bps），每日換倉 × 2
+COST_BPS          = 0       # 單邊交易成本（bps），每日換倉 × 2
 ANNUAL_DAYS       = 252
 CAPITAL_USAGE     = 0.5      # 資金使用率：0.5 = 50% 投入，50% 現金
 
