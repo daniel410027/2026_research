@@ -150,18 +150,19 @@ def load_market_return(db_make_dir: Path) -> pd.Series:
 
 
 def assign_deciles(df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
-    """每個交易日依 y_prob 降序分 n 組，Decile 1 = 最高 prob。"""
-    def _decile(group):
-        group = group.copy()
-        group["decile"] = pd.qcut(
-            group["y_prob"].rank(method="first", ascending=False),
-            q=n,
-            labels=range(1, n + 1),
-        )
-        return group
-
-    df = df.groupby(DATE_COL, group_keys=False).apply(_decile)
-    df["decile"] = df["decile"].astype(int)
+    """每個交易日依 y_prob 降序分 n 組，Decile 1 = 最高 prob。
+    Vectorized 實作，避免 pandas 2.x groupby.apply 的 index 問題。
+    """
+    df = df.copy().reset_index(drop=True)
+    df["_rank"] = df.groupby(DATE_COL)["y_prob"].rank(method="first", ascending=False)
+    df["_size"] = df.groupby(DATE_COL)["y_prob"].transform("count")
+    mask = df["_size"] >= n
+    df["decile"] = np.nan
+    df.loc[mask, "decile"] = np.ceil(
+        df.loc[mask, "_rank"] / df.loc[mask, "_size"] * n
+    ).clip(1, n).astype(int)
+    df["decile"] = df["decile"].astype("Int64")
+    df = df.drop(columns=["_rank", "_size"])
     return df
 
 
@@ -194,7 +195,7 @@ def daily_returns(
         .unstack("decile")
         .sort_index()
     )
-    ret.columns = [f"D{c}" for c in ret.columns]
+    ret.columns = [f"D{int(c)}" for c in ret.columns]
 
     # 扣交易成本 → 乘資金使用率
     ret = (ret - cost) * capital_usage
