@@ -692,16 +692,27 @@ class FeatureMixin:
         #   否則 rolling(3) 會在日頻上跑，語意變成「3個交易日」而非「3個月」。
         if "monthly_revenue" in df.columns:
 
+            # ⚠ pandas 2.x groupby.apply pivot 陷阱：
+            #   若每個 group 回傳的 Series 以「共用日期索引」為 index（所有股票
+            #   交易日相同），pandas 會把這些 Series 展開成寬表 DataFrame，導致
+            #   後續 assign 觸發「Cannot set a DataFrame with multiple columns」。
+            #   解法：全程保留原始 df 整數索引，apply 結束後直接對齊原 df。
+
             def _rev_growth(group: pd.DataFrame) -> pd.DataFrame:
+                orig_index = group.index                       # 原始 df 整數索引
                 g = group.set_index("年月日")["monthly_revenue"]
+                date_idx = g.index
                 # 月頻：取每月最後一個非 NaN 值
                 m = g.resample("ME").last().dropna()
-                idx = g.index
                 if len(m) < 4:
-                    return pd.DataFrame({
-                        "近3月累計營收變動率％_rev": pd.Series(np.nan, index=idx),
-                        "近12月累計營收成長率_rev":  pd.Series(np.nan, index=idx),
-                    })
+                    out = pd.DataFrame(
+                        {
+                            "近3月累計營收變動率％_rev": np.nan,
+                            "近12月累計營收成長率_rev":  np.nan,
+                        },
+                        index=orig_index,
+                    )
+                    return out
                 # 近3月累計 vs 前3月累計
                 r3     = m.rolling(3, min_periods=3).sum()
                 r3_lag = r3.shift(3)
@@ -710,17 +721,21 @@ class FeatureMixin:
                 r12     = m.rolling(12, min_periods=6).sum()
                 r12_lag = r12.shift(12)
                 chg12   = (r12 / (r12_lag.abs() + 1e-9) - 1).clip(-2, 10)
-                # reindex 回日頻，ffill
-                return pd.DataFrame({
-                    "近3月累計營收變動率％_rev": chg3.reindex(idx, method="ffill"),
-                    "近12月累計營收成長率_rev":  chg12.reindex(idx, method="ffill"),
-                })
+                # reindex 回日頻 ffill，再把索引還原成原始 df 整數索引
+                out = pd.DataFrame(
+                    {
+                        "近3月累計營收變動率％_rev": chg3.reindex(date_idx, method="ffill").to_numpy(),
+                        "近12月累計營收成長率_rev":  chg12.reindex(date_idx, method="ffill").to_numpy(),
+                    },
+                    index=orig_index,
+                )
+                return out
 
-            rev_result = (
-                df.groupby("證券代碼", group_keys=False)
-                .apply(_rev_growth, include_groups=False)
-                .reset_index(level=0, drop=True)
+            rev_result = df.groupby("證券代碼", group_keys=False).apply(
+                _rev_growth, include_groups=False
             )
+            # rev_result 以原始 df 整數索引對齊，reindex 確保順序一致
+            rev_result = rev_result.reindex(df.index)
             df["近3月累計營收變動率％_rev"] = rev_result["近3月累計營收變動率％_rev"].fillna(0)
             df["近12月累計營收成長率_rev"]  = rev_result["近12月累計營收成長率_rev"].fillna(0)
 
@@ -728,21 +743,30 @@ class FeatureMixin:
             # ⚠ 需在月頻做 expanding().min()，並 shift(1) 避免分母含當月自身
             # ⚠ resample 用 "BME"（Business Month End）確保 reindex ffill 能正確對齊
             def _hist_low_ratio(group: pd.DataFrame) -> pd.Series:
+                orig_index = group.index                       # 原始 df 整數索引
                 g = group.set_index("年月日")["monthly_revenue"]
+                date_idx = g.index
+                if g.dropna().empty:
+                    return pd.Series(np.nan, index=orig_index,
+                                     name="與歷史最低單月營收比%_rev")
                 m = g.resample("BME").last().dropna()
-                idx = g.index
                 if m.empty:
-                    return pd.Series(np.nan, index=idx)
-                hist_min = m.expanding().min().shift(1)   # 截至上個月的歷史最低
+                    return pd.Series(np.nan, index=orig_index,
+                                     name="與歷史最低單月營收比%_rev")
+                hist_min = m.expanding().min().shift(1)         # 截至上個月的歷史最低
                 ratio = (m / (hist_min.abs() + 1e-9) - 1).clip(0, 100)
-                return ratio.reindex(idx, method="ffill")
+                vals = ratio.reindex(date_idx, method="ffill").to_numpy()
+                # 還原成原始 df 整數索引，避免共用日期索引被 pivot 成寬表
+                return pd.Series(vals, index=orig_index,
+                                 name="與歷史最低單月營收比%_rev")
 
-            df["與歷史最低單月營收比%_rev"] = (
-                df.groupby("證券代碼", group_keys=False)
-                .apply(_hist_low_ratio, include_groups=False)
-                .reset_index(level=0, drop=True)
-                .fillna(0)
+            hist_low = df.groupby("證券代碼", group_keys=False).apply(
+                _hist_low_ratio, include_groups=False
             )
+            # 防呆：若 pandas 仍意外回傳 DataFrame，取第一欄壓平
+            if isinstance(hist_low, pd.DataFrame):
+                hist_low = hist_low.iloc[:, 0]
+            df["與歷史最低單月營收比%_rev"] = hist_low.reindex(df.index).fillna(0)
             print("    月營收衍生特徵（3m/12m成長率月頻正確版 / 歷史最低比月頻+shift）✓")
 
         # 單月每股營收
@@ -1108,47 +1132,57 @@ class FeatureMixin:
         # ─── 累計每股稅後盈餘(WA)_rev（TTM）────────────────────
         if "eps" in df.columns:
 
+            # ⚠ 同 _add_fundamental_features：apply 必須回傳「原始 df 整數索引」
+            #   的 Series，否則共用日期索引會被 pandas pivot 成寬表 DataFrame。
             def _ttm_eps(group: pd.DataFrame) -> pd.Series:
+                orig_index = group.index
                 g = group.set_index("年月日")["eps"]
+                date_idx = g.index
                 g_filled = g.ffill()
                 q_vals = g_filled.resample("QE").last().dropna()
                 if q_vals.empty:
-                    return pd.Series(np.nan, index=g.index)
+                    return pd.Series(np.nan, index=orig_index,
+                                     name="累計每股稅後盈餘(WA)_rev")
                 ttm = q_vals.rolling(4, min_periods=4).sum()
-                return ttm.reindex(g.index, method="ffill")
+                vals = ttm.reindex(date_idx, method="ffill").to_numpy()
+                return pd.Series(vals, index=orig_index,
+                                 name="累計每股稅後盈餘(WA)_rev")
 
-            df["累計每股稅後盈餘(WA)_rev"] = (
-                df.groupby("證券代碼", group_keys=False)
-                .apply(_ttm_eps, include_groups=False)
-                .reset_index(level=0, drop=True)
-                .fillna(0)
+            ttm_result = df.groupby("證券代碼", group_keys=False).apply(
+                _ttm_eps, include_groups=False
             )
+            if isinstance(ttm_result, pd.DataFrame):   # 防呆壓平
+                ttm_result = ttm_result.iloc[:, 0]
+            df["累計每股稅後盈餘(WA)_rev"] = ttm_result.reindex(df.index).fillna(0)
             print("    累計每股稅後盈餘(WA)_rev (TTM 4Q) ✓")
 
         # ─── 去年累計稅前盈餘_rev（上一完整年度合計）──────────
         if "pretax_profit" in df.columns:
 
             def _prev_year_pretax(group: pd.DataFrame) -> pd.Series:
+                orig_index = group.index
                 g = group.set_index("年月日")["pretax_profit"]
+                date_idx = g.index
                 g_filled = g.ffill()
                 q_vals = g_filled.resample("QE").last().dropna()
                 if q_vals.empty:
-                    return pd.Series(np.nan, index=g.index)
+                    return pd.Series(np.nan, index=orig_index,
+                                     name="去年累計稅前盈餘_rev")
                 # 各年合計
                 annual = q_vals.groupby(q_vals.index.year).sum()
-                year_map = g.index.year
-                prev = pd.Series(
-                    [annual.get(y - 1, np.nan) for y in year_map],
-                    index=g.index,
+                vals = np.array(
+                    [annual.get(y - 1, np.nan) for y in date_idx.year],
+                    dtype=float,
                 )
-                return prev
+                return pd.Series(vals, index=orig_index,
+                                 name="去年累計稅前盈餘_rev")
 
-            df["去年累計稅前盈餘_rev"] = (
-                df.groupby("證券代碼", group_keys=False)
-                .apply(_prev_year_pretax, include_groups=False)
-                .reset_index(level=0, drop=True)
-                .fillna(0)
+            pretax_result = df.groupby("證券代碼", group_keys=False).apply(
+                _prev_year_pretax, include_groups=False
             )
+            if isinstance(pretax_result, pd.DataFrame):   # 防呆壓平
+                pretax_result = pretax_result.iloc[:, 0]
+            df["去年累計稅前盈餘_rev"] = pretax_result.reindex(df.index).fillna(0)
             print("    去年累計稅前盈餘_rev ✓")
 
         self.df = df.copy()   # 整合碎片化欄位

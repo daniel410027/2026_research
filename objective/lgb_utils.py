@@ -148,34 +148,43 @@ def _make_cv_folds(
 # ============================================================
 
 def tune_lgb(
-    X_train:       pd.DataFrame,
-    y_train:       pd.Series,
-    n_splits:      int,
-    n_trials:      int,
-    random_state:  int,
-    sample_weight: np.ndarray | None = None,
-    dates:         pd.Series | np.ndarray | None = None,
-) -> tuple[dict, np.ndarray]:
+    X_train:           pd.DataFrame,
+    y_train:           pd.Series,
+    n_splits:          int,
+    n_trials:          int,
+    random_state:      int,
+    sample_weight:     np.ndarray | None = None,
+    dates:             pd.Series | np.ndarray | None = None,
+    return_best_iters: bool = False,
+) -> tuple[dict, np.ndarray] | tuple[dict, np.ndarray, list[int]]:
     """
     Optuna TPE 調參 + 最佳參數 OOF prob 收集（date-aware CV）。
 
     最佳參數確定後，只再跑一輪 CV 收集 OOF prob，
     供 find_threshold 使用，不額外增加訓練負擔。
 
+    [2026-06 更新] return_best_iters=True 時：
+    - OOF 收集改用「1000 輪 + ES(50)」（與 objective 內的訓練方式一致），
+      並回傳 (best_params, oof_prob, best_iters)；
+      best_iters 供呼叫端設定 final model 的 num_boost_round。
+    - 預設 False 時行為與舊版相同（model.py 不受影響）。
+
     Parameters
     ----------
-    X_train, y_train : 訓練集
-    n_splits         : 摺數
-    n_trials         : Optuna trial 數
-    random_state     : 隨機種子
-    sample_weight    : 可選 shape=(n_train,)（inverse-vol weight 等）
-    dates            : 可選，與 X_train 逐列對齊的日期序列；
-                       提供時以唯一交易日為單位切折（建議）
+    X_train, y_train  : 訓練集
+    n_splits          : 摺數
+    n_trials          : Optuna trial 數
+    random_state      : 隨機種子
+    sample_weight     : 可選 shape=(n_train,)（inverse-vol weight 等）
+    dates             : 可選，與 X_train 逐列對齊的日期序列；
+                        提供時以唯一交易日為單位切折（建議）
+    return_best_iters : True 時回傳 3-tuple（含每折 best_iteration）
 
     Returns
     -------
     best_params : dict         ── Optuna 最佳超參數（不含 base params）
     oof_prob    : np.ndarray   ── OOF 預測機率（未被任何 valid fold 命中者為 NaN）
+    best_iters  : list[int]    ── 僅 return_best_iters=True 時
     """
     cv_folds = _make_cv_folds(X_train, n_splits, dates)
 
@@ -215,6 +224,14 @@ def tune_lgb(
     print(f"  Best CV log-loss: {study.best_value:.6f}")
 
     # ── 最佳參數 OOF prob ────────────────────────────────────
+    if return_best_iters:
+        # 與 objective 一致：1000 輪 + ES(50)，並回收每折 best_iteration
+        oof_prob, best_iters = collect_oof_prob(
+            X_train, y_train, best_params, n_splits, sample_weight, dates,
+            num_boost_round=1000, early_stopping_rounds=50, return_best_iters=True,
+        )
+        return best_params, oof_prob, best_iters
+
     oof_prob = collect_oof_prob(
         X_train, y_train, best_params, n_splits, sample_weight, dates
     )
@@ -223,48 +240,83 @@ def tune_lgb(
 
 
 def collect_oof_prob(
-    X_train:       pd.DataFrame,
-    y_train:       pd.Series,
-    best_params:   dict,
-    n_splits:      int,
-    sample_weight: np.ndarray | None = None,
-    dates:         pd.Series | np.ndarray | None = None,
-) -> np.ndarray:
+    X_train:               pd.DataFrame,
+    y_train:               pd.Series,
+    best_params:           dict,
+    n_splits:              int,
+    sample_weight:         np.ndarray | None = None,
+    dates:                 pd.Series | np.ndarray | None = None,
+    num_boost_round:       int = 500,
+    early_stopping_rounds: int | None = None,
+    return_best_iters:     bool = False,
+) -> np.ndarray | tuple[np.ndarray, list[int]]:
     """
     固定超參數下，只跑 date-aware CV 收集 OOF prob。
 
     用於超參數凍結模式：跳過 Optuna，直接用 frozen params 評估 threshold，
     耗時約為 tune_lgb 的 1/n_trials。
 
+    [2026-06 更新] 新增 early stopping 與 best_iteration 回傳：
+    - early_stopping_rounds 提供時，每折以 valid fold 做 ES，
+      OOF prob 由 best_iteration 截斷的模型產生（與 tune_lgb objective 一致）。
+    - return_best_iters=True 時回傳 (oof_prob, best_iters)，
+      供呼叫端決定 final model 的 num_boost_round（取中位數等）。
+    - 預設參數下行為與舊版完全相同（500 輪、無 ES、只回傳 oof_prob），
+      model.py 等既有呼叫端不受影響。
+
     Parameters
     ----------
-    X_train, y_train : 訓練集
-    best_params      : 已凍結的超參數 dict（不含 base params）
-    n_splits         : 摺數
-    sample_weight    : 可選 shape=(n_train,)
-    dates            : 可選，與 X_train 逐列對齊的日期序列
+    X_train, y_train      : 訓練集
+    best_params           : 已凍結的超參數 dict（不含 base params）
+    n_splits              : 摺數
+    sample_weight         : 可選 shape=(n_train,)
+    dates                 : 可選，與 X_train 逐列對齊的日期序列
+    num_boost_round       : 每折最大輪數（預設 500；搭配 ES 時建議 1000）
+    early_stopping_rounds : 提供時啟用 early stopping
+    return_best_iters     : True 時回傳 (oof_prob, best_iters)
 
     Returns
     -------
     oof_prob : np.ndarray  ── 與 y_train 等長；
                最早一段（從不在任何 valid fold）保持 NaN，
                由 find_threshold 自動略過，避免污染門檻搜尋。
+    best_iters : list[int]（僅 return_best_iters=True 時）
+               每折的 best_iteration（無 ES 時為 num_boost_round）。
     """
-    cv_folds = _make_cv_folds(X_train, n_splits, dates)
-    params   = {**_LGB_BASE_PARAMS, **best_params}
-    oof_prob = np.full(len(y_train), np.nan)   # NaN 初始化（非 0）
+    cv_folds   = _make_cv_folds(X_train, n_splits, dates)
+    params     = {**_LGB_BASE_PARAMS, **best_params}
+    oof_prob   = np.full(len(y_train), np.nan)   # NaN 初始化（非 0）
+    best_iters = []
 
     for tr_idx, va_idx in cv_folds:
         w_tr = sample_weight[tr_idx] if sample_weight is not None else None
-        m = lgb.train(
-            params,
-            lgb.Dataset(
-                X_train.iloc[tr_idx], label=y_train.iloc[tr_idx], weight=w_tr
-            ),
-            num_boost_round=500,
+        w_va = sample_weight[va_idx] if sample_weight is not None else None
+        train_set = lgb.Dataset(
+            X_train.iloc[tr_idx], label=y_train.iloc[tr_idx], weight=w_tr
         )
-        oof_prob[va_idx] = m.predict(X_train.iloc[va_idx])
+        if early_stopping_rounds is not None:
+            m = lgb.train(
+                params,
+                train_set,
+                num_boost_round=num_boost_round,
+                valid_sets=[
+                    lgb.Dataset(
+                        X_train.iloc[va_idx], label=y_train.iloc[va_idx], weight=w_va
+                    )
+                ],
+                callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=False)],
+            )
+            best_iters.append(int(m.best_iteration))
+            oof_prob[va_idx] = m.predict(
+                X_train.iloc[va_idx], num_iteration=m.best_iteration
+            )
+        else:
+            m = lgb.train(params, train_set, num_boost_round=num_boost_round)
+            best_iters.append(num_boost_round)
+            oof_prob[va_idx] = m.predict(X_train.iloc[va_idx])
 
+    if return_best_iters:
+        return oof_prob, best_iters
     return oof_prob
 
 
