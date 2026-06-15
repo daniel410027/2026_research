@@ -38,6 +38,8 @@ Walk-Forward 回測模組。
         decile_summary_bar.png      各組年化報酬 & Sharpe 橫向比較
         excess_return.png           D1 excess return 累積曲線
         drawdown_decile1.png        D1 水下曲線
+        excess_drawdown_decile1.png D1 相對大盤回撤水下曲線（多少 / 多久）
+        excess_drawdown_episodes.csv 每段水下期間明細（深度、谷底、追平、天數）
         daily_returns.csv           每日各組報酬（含 market、excess_D1 欄）
 
 ─────────────────────────────────────────────
@@ -75,7 +77,17 @@ OUTPUT_DIR        = Path("output/backtest")
 N_DECILES         = 10
 COST_BPS          = 0       # 單邊交易成本（bps），每日換倉 × 2
 ANNUAL_DAYS       = 252
-CAPITAL_USAGE     = 0.5      # 資金使用率：0.5 = 50% 投入，50% 現金
+CAPITAL_USAGE     = 1.0      # 資金使用率：1.0 = 滿倉投入（與大盤 100% 對等，便於解讀 alpha）
+
+# ── β-neutral 超額報酬設定 ──────────────────────────────
+#   excess_D1 = D1 − β·market（取代原本的算術差 D1 − market）
+#   BETA_MODE:
+#     "rolling"   滾動窗 β（ex-ante，無未來函數）← 預設，適合可交易避險解讀
+#     "expanding" 擴張窗 β（用 t 之前所有資料，ex-ante）
+#     "full"      全樣本單一 β（ex-post 歸因，含 look-ahead，不可作交易比例）
+BETA_MODE         = "rolling"
+BETA_WINDOW       = 252      # rolling 視窗（交易日）
+BETA_MIN_PERIODS  = 60       # 估計 β 所需最少樣本
 
 DATE_COL = "年月日"
 MKT_COL  = "market_return"
@@ -164,6 +176,44 @@ def assign_deciles(df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
     df["decile"] = df["decile"].astype("Int64")
     df = df.drop(columns=["_rank", "_size"])
     return df
+
+
+def estimate_beta(
+    strat: pd.Series,
+    mkt: pd.Series,
+    mode: str = "rolling",
+    window: int = 252,
+    min_periods: int = 60,
+) -> pd.Series:
+    """估計策略對大盤的 β = Cov(strat, mkt) / Var(mkt)，回傳對齊 strat 的 β 序列。
+
+    mode
+    ----
+    "full"      全樣本單一 β（事後歸因；含 look-ahead，不可作為「可交易」避險比例）
+    "expanding" 擴張窗 β（用 t-1 以前所有資料）
+    "rolling"   滾動窗 β（用 t-1 以前 window 天）← 預設
+
+    rolling / expanding 皆對 β 做 shift(1)，確保 t 日的避險比例僅用 t-1 以前資訊
+    （無未來函數，符合 walk-forward 精神）。warm-up 期以第一個有效 β 回填，
+    仍缺則設 1.0（退化為原本的算術差）。
+    """
+    pair = pd.concat([strat.rename("s"), mkt.rename("m")], axis=1).dropna()
+
+    if mode == "full":
+        var_m = pair["m"].var()
+        b = pair["s"].cov(pair["m"]) / var_m if var_m > 0 else 1.0
+        return pd.Series(b, index=strat.index)
+
+    if mode == "expanding":
+        cov = pair["s"].expanding(min_periods=min_periods).cov(pair["m"])
+        var = pair["m"].expanding(min_periods=min_periods).var()
+    else:  # rolling
+        cov = pair["s"].rolling(window, min_periods=min_periods).cov(pair["m"])
+        var = pair["m"].rolling(window, min_periods=min_periods).var()
+
+    beta = (cov / var).shift(1)               # 無未來函數
+    beta = beta.reindex(strat.index).bfill().fillna(1.0)
+    return beta
 
 
 def daily_returns(
@@ -427,6 +477,124 @@ def plot_drawdown(ret_df: pd.DataFrame, output_dir: Path):
     print("  ✓ drawdown_decile1.png")
 
 
+def relative_drawdown(strat: pd.Series, market: pd.Series):
+    """策略相對大盤的 NAV 比值與回撤序列。
+
+    rel  = (1+strat).cumprod() / (1+market).cumprod()  ← 相對財富曲線
+    dd   = rel / rel.cummax() - 1                       ← 距「歷史最佳領先」的跌幅
+
+    dd 觸底 = 策略相對大盤輸最多的時點；dd 回到 0 = 重新追回先前的領先高點。
+    僅取 strat 與 market 同時有值的交易日。
+    """
+    common = strat.dropna().index.intersection(market.dropna().index)
+    s = strat.loc[common].sort_index()
+    m = market.loc[common].sort_index()
+    rel = (1 + s).cumprod() / (1 + m).cumprod()
+    dd  = rel / rel.cummax() - 1.0
+    return rel, dd
+
+
+def drawdown_episodes(dd: pd.Series) -> pd.DataFrame:
+    """將回撤序列切成一段段「水下期間」。
+
+    欄位：peak（領先高點日）/ trough（輸最多日）/ recovery（追平日，未追平為 NaT）
+          depth（最大相對回撤）/ days_to_trough / days_underwater / ongoing
+    依 depth 由深到淺排序。
+    """
+    rows = []
+    in_ep = False
+    peak_date = dd.index[0]
+    trough_date, trough_val = peak_date, 0.0
+
+    for date, d in dd.items():
+        if d < -1e-12:                       # 水下中
+            if not in_ep:
+                in_ep, trough_val, trough_date = True, d, date
+            elif d < trough_val:
+                trough_val, trough_date = d, date
+        else:                                # 回到（新）高點
+            if in_ep:
+                rows.append(dict(peak=peak_date, trough=trough_date,
+                                 recovery=date, depth=trough_val, ongoing=False))
+                in_ep = False
+            peak_date = date
+
+    if in_ep:                                # 序列結束時仍在水下
+        rows.append(dict(peak=peak_date, trough=trough_date,
+                         recovery=pd.NaT, depth=trough_val, ongoing=True))
+
+    cols = ["peak", "trough", "recovery", "depth",
+            "days_to_trough", "days_underwater", "ongoing"]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+
+    tab = pd.DataFrame(rows)
+    for c in ("peak", "trough", "recovery"):
+        tab[c] = pd.to_datetime(tab[c])
+    last_date = dd.index[-1]
+    rec = tab["recovery"].fillna(last_date)
+    tab["days_to_trough"]  = (tab["trough"] - tab["peak"]).dt.days
+    tab["days_underwater"] = (rec - tab["peak"]).dt.days
+    return tab[cols].sort_values("depth").reset_index(drop=True)
+
+
+def plot_excess_drawdown(ret_df: pd.DataFrame, output_dir: Path):
+    """D1 相對大盤回撤（relative drawdown vs market）水下曲線 + 水下期間明細。
+
+    回答兩個問題：
+      多少 → 相對大盤最大回撤深度（最深那段，max relative drawdown）
+      多久 → 水下期間天數（peak→recovery，最久那段；常與最深段不同）
+
+    回傳 episodes 表供主流程列印；同時輸出 excess_drawdown_episodes.csv。
+    """
+    if "D1" not in ret_df.columns or "market" not in ret_df.columns:
+        return None
+
+    rel, dd = relative_drawdown(ret_df["D1"], ret_df["market"])
+    if dd.empty:
+        return None
+
+    episodes = drawdown_episodes(dd)
+    episodes.to_csv(output_dir / "excess_drawdown_episodes.csv",
+                    index=False, encoding="utf-8-sig")
+
+    deepest = episodes.iloc[0]                              # depth 最深
+    longest = episodes.loc[episodes["days_underwater"].idxmax()]  # 水下最久
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.fill_between(dd.index, dd.values, 0, color="#7b2d8b", alpha=0.45)
+    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=1))
+    ax.set_title("D1 Relative Drawdown vs Market（相對大盤回撤）", fontsize=12)
+    ax.axhline(0, color="black", linewidth=0.6)
+    ax.spines[["top", "right"]].set_visible(False)
+
+    # 最久那段：底色陰影
+    end = dd.index[-1] if bool(longest["ongoing"]) else longest["recovery"]
+    ax.axvspan(longest["peak"], end, color="#7b2d8b", alpha=0.10)
+
+    # 最深那段：箭頭標註（深度 + 水下天數）
+    ax.annotate(
+        f"最深 {deepest['depth']:.1%} / {int(deepest['days_underwater'])}d",
+        xy=(deepest["trough"], deepest["depth"]),
+        xytext=(deepest["trough"], deepest["depth"] * 0.55),
+        fontsize=8, color="#7b2d8b", ha="center",
+        arrowprops=dict(arrowstyle="->", color="#7b2d8b"),
+    )
+    if longest["peak"] != deepest["peak"]:
+        ax.annotate(
+            f"最久 {int(longest['days_underwater'])}d",
+            xy=(longest["trough"], longest["depth"]),
+            fontsize=8, color="#555", ha="center", va="top",
+        )
+
+    plt.tight_layout()
+    fig.savefig(output_dir / "excess_drawdown_decile1.png", dpi=150)
+    plt.close(fig)
+    print("  ✓ excess_drawdown_decile1.png")
+    print("  ✓ excess_drawdown_episodes.csv")
+    return episodes
+
+
 # ============================================================
 #  主流程
 # ============================================================
@@ -493,6 +661,27 @@ def main():
     plot_decile_summary(metrics_df, OUTPUT_DIR)
     plot_annual_decile1(ret_df, OUTPUT_DIR)
     plot_drawdown(ret_df, OUTPUT_DIR)
+    episodes = plot_excess_drawdown(ret_df, OUTPUT_DIR)
+
+    if episodes is not None and not episodes.empty:
+        deepest = episodes.iloc[0]
+        longest = episodes.loc[episodes["days_underwater"].idxmax()]
+        print("\n► 相對大盤回撤（D1 vs market）")
+        print(f"    輸最多（最深）：{deepest['depth']:.2%}"
+              f"  谷底 {deepest['trough'].date()}"
+              f"  水下 {int(deepest['days_underwater'])} 天"
+              f"{'（尚未追平）' if deepest['ongoing'] else ''}")
+        print(f"    輸最久（最長水下）：{int(longest['days_underwater'])} 天"
+              f"  {longest['peak'].date()} → "
+              f"{'至今' if longest['ongoing'] else longest['recovery'].date()}"
+              f"  深度 {longest['depth']:.2%}")
+        print("\n  前 5 大水下期間：")
+        show = episodes.head(5).copy()
+        for c in ("peak", "trough", "recovery"):
+            show[c] = show[c].dt.date.astype(str)
+        show["depth"] = (show["depth"] * 100).round(2).astype(str) + "%"
+        print(show[["peak", "trough", "recovery", "depth",
+                    "days_underwater", "ongoing"]].to_string(index=False))
 
     print(f"\n{'='*60}")
     print(f"  完成  →  {OUTPUT_DIR}/")
