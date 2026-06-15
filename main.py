@@ -34,6 +34,31 @@ Walk-Forward Pipeline 入口（靜態研究版）。
         walk_forward_summary.csv    所有 window 的彙總指標表
 
 ─────────────────────────────────────────────
+  ★ 2026-06-15（1）：繞過 objective/__init__.py
+─────────────────────────────────────────────
+  本實驗空間（2026_research）的 objective/__init__.py 內有
+      from daily_model import DailyConfig, DailyTrainer
+  而 daily_model.py 屬於另一個（live）專案、不在此 repo →
+  任何正常 import objective 套件都會先執行 __init__.py 而觸發 ModuleNotFoundError。
+  與 make_new.py / daily_model.py 相同作法：以 importlib 直接載入 objective.model，
+  繞過 __init__.py，使 main.py 自帶載入、不依賴另一個專案。
+
+─────────────────────────────────────────────
+  ★ 2026-06-15（2）：對齊 live(daily) pipeline 訓練特徵集
+─────────────────────────────────────────────
+  daily_model.py 的 _EXCLUDE_COLS 將 amount（成交金額，僅流動性過濾用）
+  與 market_return_fwd（前視 T+1）排除於訓練之外；但 static 端的
+  model._resolve_features 會把所有數值欄當特徵，amount 沒被擋 → static
+  多用了一個 live 不會用的特徵，research 指標與實際部署脫鉤（train/serve skew）。
+
+  WalkForwardConfig 無 exclude 參數，故於 run_ml() 啟動 trainer 前，
+  以 RunConfig.EXTRA_EXCLUDE_COLS 擴充 objective.model._EXCLUDE_COLS。
+  此為 main.py 端的 alignment shim，不更動 model.py / lgb_utils.py。
+
+  註：market_return_fwd 在 make_new.py 的 KEEP_FEATURES 已被濾掉、
+      不在 database_make/ 輸出，static 無前視洩漏；仍列入排除作防呆。
+
+─────────────────────────────────────────────
   執行方式（Usage）
 ─────────────────────────────────────────────
     python main.py
@@ -51,7 +76,11 @@ Walk-Forward Pipeline 入口（靜態研究版）。
 
 from __future__ import annotations
 
+import importlib.util
+import os
+import sys
 import time
+import types
 from pathlib import Path
 
 import matplotlib
@@ -59,7 +88,41 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from objective.model import WalkForwardConfig, WalkForwardTrainer
+
+# ============================================================
+#  載入 objective 套件（繞過 __init__.py）
+# ============================================================
+# 見模組 docstring「★ 2026-06-15（1）」：本 repo 的 objective/__init__.py
+# 會 import 不存在的 daily_model（屬 live 專案）。以 importlib 直接載入
+# objective.model，註冊合成 objective 套件（帶 __path__），讓 model.py 內的
+# `from .lgb_utils import ...` 相對 import 仍能正常解析。
+
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+_OBJ  = os.path.join(_ROOT, "objective")
+
+if "objective" not in sys.modules:
+    _pkg             = types.ModuleType("objective")
+    _pkg.__path__    = [_OBJ]
+    _pkg.__package__ = "objective"
+    sys.modules["objective"] = _pkg
+
+
+def _load_obj_module(name: str) -> types.ModuleType:
+    """以 importlib 載入 objective/{name}.py，繞過 objective/__init__.py。"""
+    full = f"objective.{name}"
+    if full in sys.modules:
+        return sys.modules[full]
+    spec            = importlib.util.spec_from_file_location(full, os.path.join(_OBJ, f"{name}.py"))
+    mod             = importlib.util.module_from_spec(spec)
+    mod.__package__ = "objective"
+    sys.modules[full] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_wf_model          = _load_obj_module("model")   # ★ 模組本體，供擴充 _EXCLUDE_COLS
+WalkForwardConfig  = _wf_model.WalkForwardConfig
+WalkForwardTrainer = _wf_model.WalkForwardTrainer
 
 
 # ============================================================
@@ -80,6 +143,18 @@ class RunConfig:
     # ── 執行步驟 ─────────────────────────────────────────────
     RUN_DIAGNOSTICS = False   # 分布圖 + labels.csv（需要檢查資料時再開）
     RUN_ML          = True
+
+    # ── ★ 對齊 live(daily) 訓練特徵集 ───────────────────────
+    # True：啟動 trainer 前擴充 objective.model._EXCLUDE_COLS，
+    #       使 static walk-forward 與 daily_model.py 用同一組訓練特徵，
+    #       避免 train/serve skew（見模組 docstring）。
+    # 若研究上「刻意」想把 amount 當特徵，設為 False 即還原 model.py 預設行為。
+    ALIGN_FEATURES_WITH_LIVE = True
+    EXTRA_EXCLUDE_COLS = {
+        "amount",              # 成交金額：daily 僅作流動性過濾，不進訓練
+        "market_return_fwd",   # 前視 T+1：防呆（目前不在 database_make/ 輸出）
+        "market_index",        # 與 model._EXCLUDE_COLS 既有項目對齊（idempotent）
+    }
 
 
 # ============================================================
@@ -188,6 +263,27 @@ def load_precomputed(cfg: RunConfig) -> pd.DataFrame:
 
 
 # ============================================================
+#  ★ 特徵集對齊（與 live/daily 一致）
+# ============================================================
+
+def align_features_with_live(cfg: RunConfig):
+    """
+    擴充 objective.model._EXCLUDE_COLS，使 static walk-forward 的訓練特徵集
+    與 daily_model.py 一致（排除 amount 等非訓練欄）。
+
+    model._resolve_features 在 call time 讀取模組層級的 _EXCLUDE_COLS，
+    故只要在 WalkForwardTrainer.run() 之前完成擴充即可生效，無需改 model.py。
+    """
+    before = set(_wf_model._EXCLUDE_COLS)
+    _wf_model._EXCLUDE_COLS = before | set(cfg.EXTRA_EXCLUDE_COLS)
+    added = sorted(set(cfg.EXTRA_EXCLUDE_COLS) - before)
+    if added:
+        print(f"  ▸ 對齊 live 特徵集，額外自訓練排除：{added}")
+    else:
+        print("  ▸ live 特徵集已對齊（無新增排除欄）")
+
+
+# ============================================================
 #  主流程
 # ============================================================
 
@@ -202,6 +298,11 @@ def run_ml(cfg: RunConfig):
         save_distribution_plots(df, output_dir)
         save_label_csv(df, output_dir)
         del df   # 診斷完立即釋放記憶體
+
+    # ── ★ 訓練特徵集對齊（必須在 trainer.run() 之前）──────────
+    if cfg.ALIGN_FEATURES_WITH_LIVE:
+        print("\n► 特徵集對齊（train/serve consistency）")
+        align_features_with_live(cfg)
 
     print("\n► Walk-Forward Training")
     ml_config = WalkForwardConfig(
@@ -226,6 +327,7 @@ def main():
     print(f"  年份範圍  : {cfg.ML_WINDOW_START} ~ {cfg.ML_WINDOW_END}")
     print(f"  Label     : {cfg.LABEL}")
     print(f"  Diagnostics: {cfg.RUN_DIAGNOSTICS}")
+    print(f"  對齊 live  : {cfg.ALIGN_FEATURES_WITH_LIVE}")
     print(f"{'='*60}")
 
     if not cfg.RUN_ML:
