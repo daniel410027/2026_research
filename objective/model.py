@@ -24,6 +24,10 @@ Walk-forward LightGBM 訓練模組（FinLab 新專案版）。
             由 lgb_utils 以「唯一交易日」為單位切折（見 lgb_utils._make_cv_folds），
             消除 panel 同日 cross-sectional 邊界外洩。
 
+    [2026-06 對齊] _EXCLUDE_COLS 納入 amount / market_return_fwd：
+    - 將「排除非訓練欄」收回本模組，與 daily_model.py 用同一訓練特徵集。
+    - 此檔在 2026_daily 與 2026_research 兩 repo 通用（內容相同即可同步）。
+
 Walk-forward 規則：
     Windows: (2014,2016), (2015,2017), ..., (2022,2024)
     每個 window：
@@ -79,6 +83,13 @@ _EXCLUDE_COLS = {
     "證券代碼", "年月日", "market_index",
     "return", "return_tick", "return_tick_0",
     "excess_return", "excess_return_tick",
+    # [2026-06 對齊 live] 以下兩欄納入 base，使 WF 與 daily_model.py 共用同一訓練特徵集。
+    #   排除邏輯自此集中於本模組，不再依賴各進入點（main.py / main_fix.py）以
+    #   EXTRA_EXCLUDE_COLS 擴充；其既有 union 變為 idempotent 冗餘，可保留不動。
+    #   注意：目前 database_make/ 並無這兩欄，故此改動不會改變現有特徵集，
+    #         純為防止未來 schema 新增時的靜默 train/serve 漂移。
+    "amount",            # 成交金額：僅作流動性過濾，不進訓練
+    "market_return_fwd", # 前視 T+1：label 建構用，防呆排除
 }
 
 
