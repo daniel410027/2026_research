@@ -35,7 +35,7 @@ Walk-Forward 回測模組。
         decile_metrics.csv          10 組的 return/std/sharpe/mdd/alpha/IR 等指標
         cumulative_returns.png      10 組累積報酬曲線（含大盤基準線）
         annual_decile1.png          Decile 1 各年度表現長條圖（含大盤對照）
-        decile_summary_bar.png      各組年化報酬 & Sharpe 橫向比較
+        decile_summary_bar.png      各組年化報酬（ln 形式）& Sharpe 橫向比較
         excess_return.png           D1 excess return 累積曲線
         drawdown_decile1.png        D1 水下曲線
         excess_drawdown_decile1.png D1 相對大盤回撤水下曲線（多少 / 多久）
@@ -64,8 +64,57 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+import matplotlib.font_manager as fm
 import numpy as np
 import pandas as pd
+
+
+# ============================================================
+#  中文字型（CJK font）設定
+# ============================================================
+
+def setup_cjk_font(verbose: bool = True) -> str | None:
+    """自動偵測並設定支援中文的 matplotlib 字型，避免圖中中文變方框（tofu）。
+
+    依序嘗試常見跨平台 CJK 字型；找到第一個「已安裝」者即套用。
+    同時關閉 unicode_minus，避免負號顯示成方框。
+
+    回傳套用的字型名稱；全部找不到回傳 None（中文仍會是方框）。
+    可手動指定：把想要的字型名稱插到 candidates 最前面即可。
+    """
+    candidates = [
+        # Windows
+        "Microsoft JhengHei",   # 微軟正黑體（繁中）
+        "Microsoft YaHei",      # 微軟雅黑（簡中）
+        # macOS
+        "PingFang TC", "PingFang SC", "Heiti TC", "Heiti SC",
+        # Linux / 通用（Noto / 思源 / 文泉驛 / 台北黑體）
+        "Taipei Sans TC Beta",
+        "Noto Sans CJK TC", "Noto Sans CJK SC", "Noto Sans CJK JP",
+        "Source Han Sans TC", "Source Han Sans CN", "Source Han Sans",
+        "WenQuanYi Zen Hei", "WenQuanYi Micro Hei",
+        "Droid Sans Fallback",
+    ]
+    installed = {f.name for f in fm.fontManager.ttflist}
+
+    chosen = next((name for name in candidates if name in installed), None)
+    if chosen is not None:
+        # 把選定字型放最前面，後面保留其餘候選作為缺字 fallback
+        plt.rcParams["font.sans-serif"] = (
+            [chosen] + [n for n in candidates if n in installed and n != chosen]
+        )
+        plt.rcParams["font.family"] = "sans-serif"
+        plt.rcParams["axes.unicode_minus"] = False   # 負號正常顯示
+        if verbose:
+            print(f"  [font] 套用 CJK 字型：{chosen}")
+        return chosen
+
+    if verbose:
+        print("  [font] [WARN] 找不到任何 CJK 字型，圖中中文可能顯示為方框。")
+        print("         請安裝其一：Noto Sans CJK TC / 思源黑體 / 微軟正黑體，"
+              "或自行把字型名稱加進 setup_cjk_font() 的 candidates。")
+    return None
+
 
 # ============================================================
 #  設定
@@ -390,22 +439,25 @@ def plot_decile_summary(metrics_df: pd.DataFrame, output_dir: Path):
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     x = np.arange(len(decile_rows))
 
-    # 年化報酬（含大盤基準橫線）
+    # 年化報酬（ln 形式：ln(1+R)，連續複利年化，含大盤基準橫線）
+    #   破表的 D1 年化（~499%）在算術尺度會壓扁其他組；改 ln(1+R) 後尺度與
+    #   cumulative_returns.png 的 log NAV 一致，組間差異更易判讀。
     ax = axes[0]
-    bars = ax.bar(x, sub_df["ann_return"], color=COLORS, edgecolor="none", alpha=0.85)
+    ln_ret = np.log1p(sub_df["ann_return"].clip(lower=-0.999))   # ln(1 + ann_return)
+    bars = ax.bar(x, ln_ret, color=COLORS, edgecolor="none", alpha=0.85)
     if "market" in metrics_df.index:
-        ax.axhline(metrics_df.loc["market", "ann_return"], color="black",
-                   linewidth=1.2, linestyle="--", label="Market")
+        ax.axhline(np.log1p(max(metrics_df.loc["market", "ann_return"], -0.999)),
+                   color="black", linewidth=1.2, linestyle="--", label="Market")
         ax.legend(fontsize=8)
     ax.set_xticks(x); ax.set_xticklabels(decile_rows, fontsize=9)
-    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=1))
-    ax.set_title("Annualised Return by Decile", fontsize=11)
+    ax.set_ylabel("ln(1 + annualised return)", fontsize=9)
+    ax.set_title("Annualised Return by Decile (ln)", fontsize=11)
     ax.axhline(0, color="gray", linewidth=0.8)
     ax.spines[["top", "right"]].set_visible(False)
-    for bar, val in zip(bars, sub_df["ann_return"]):
+    for bar, ln_val, raw in zip(bars, ln_ret, sub_df["ann_return"]):
         ax.text(bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 0.002 * np.sign(val + 1e-9),
-                f"{val:.1%}", ha="center", va="bottom", fontsize=8)
+                bar.get_height() + 0.02 * np.sign(ln_val + 1e-9),
+                f"{ln_val:.2f}\n({raw:.0%})", ha="center", va="bottom", fontsize=7)
 
     # Sharpe
     ax = axes[1]
@@ -601,6 +653,7 @@ def plot_excess_drawdown(ret_df: pd.DataFrame, output_dir: Path):
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    setup_cjk_font()   # 設定中文字型，避免圖中中文變方框
 
     print(f"\n{'='*60}")
     print(f"  Backtest")

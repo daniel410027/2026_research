@@ -19,6 +19,23 @@ FeatureMixin：所有特徵工程方法（_add_*）。
         _add_fundamental_features        月營收 / EPS 衍生特徵
     - _add_short_selling_features 改用 FinLab security_lending 欄位
 
+Look-ahead Bias 修正（2026-06）：
+    _add_fundamental_features：
+        - 廢除 resample("ME") / resample("BME")
+        - monthly_revenue 已是公告日 ffill 日頻，改用純日頻 rolling：
+            近3月累計營收變動率  → rolling(63).sum()  vs shift(63) rolling(63).sum()
+            近12月累計營收成長率 → rolling(252).sum() vs shift(252) rolling(252).sum()
+            與歷史最低單月營收比 → expanding().min().shift(1) 純日頻
+        - eps 在 _add_fundamental_features 的 rolling(4)（日頻語意錯誤）已移除，
+          TTM 統一由 _add_eps_cumulative_features 負責
+    _add_eps_cumulative_features：
+        - 廢除 resample("QE")（真實穿越：稀疏 eps ffill 後季末點含未來公告值）
+        - 改為：eps.shift(1)（公告隔日生效）→ ffill → rolling(252).sum()（TTM）
+          注意：make.py preprocess 已對 eps 做 per-stock ffill，
+                進入此方法時 eps 已是日頻連續值，shift(1) 確保公告當日不可用
+        - pretax_profit 同樣改為 shift(1) + ffill + rolling(252).sum().shift(252)
+        - 累計稅後盈餘成長率％_rev 從 _add_fundamental_features 移至此方法統一計算
+
 作者：Daniel Huang
 """
 
@@ -28,6 +45,13 @@ import numpy as np
 import pandas as pd
 
 from . import ta_indicators as ta
+
+# ─────────────────────────────────────────────────────────────
+#  交易日視窗常數
+# ─────────────────────────────────────────────────────────────
+_W1M  = 21    # ≈ 1 個月
+_W3M  = 63    # ≈ 1 季（3 個月）
+_W12M = 252   # ≈ 1 年（12 個月）
 
 # ─────────────────────────────────────────────────────────────
 #  欄位常數（FinLab 內部標準名）
@@ -666,131 +690,126 @@ class FeatureMixin:
 
     def _add_fundamental_features(self):
         """
-        去年累計營收(千元)_rev         直接取用 monthly_revenue_ly_cum
-        單月營收成長率％_rev            直接取用 monthly_revenue_mom
-        近3月累計營收變動率％_rev       rolling(3).sum() / rolling(3).sum().shift(3) - 1
-        近12月累計營收成長率_rev        rolling(12).sum() / rolling(12).sum().shift(12) - 1
-        與歷史最低單月營收比%_rev       monthly_revenue / expanding_min - 1
-        累計稅後盈餘成長率％_rev        YTD EPS / YTD EPS.shift(252) - 1
-        單月每股稅後盈餘(WA)_rev        eps 直接取用
-        單月每股營收(元)_rev            monthly_revenue / fii_shares（每股）
+        月營收衍生特徵（純日頻 rolling，無 resample）
+
+        欄位說明：
+          去年累計營收(千元)_rev      直接取用上游 monthly_revenue_ly_cum
+                                      （FinLab 原始欄位，公告日 trigger，無穿越）
+          單月營收成長率％_rev        直接取用上游 monthly_revenue_mom
+          近3月累計營收變動率％_rev   rolling(63).sum() vs shift(63) rolling(63).sum()
+          近12月累計營收成長率_rev    rolling(252).sum() vs shift(252) rolling(252).sum()
+          與歷史最低單月營收比%_rev   expanding().min().shift(1) 純日頻
+          單月每股營收(元)_rev        monthly_revenue / fii_shares
+          單月每股稅後盈餘(WA)_rev    eps 直接取用（make.py 已 ffill）
+          累計稅後盈餘成長率％_rev    → 移至 _add_eps_cumulative_features 統一管理
+
+        修正重點（2026-06）：
+          ① 廢除所有 resample("ME") / resample("BME")
+          ② monthly_revenue 已是公告日 ffill 日頻，直接 rolling 即可
+             rolling(63)  ≈ 3 個月；rolling(252) ≈ 12 個月
+          ③ expanding min 使用 shift(1) 嚴格落後對齊
+          ④ eps rolling(4)（日頻語意錯誤：非 4 季）移除，TTM 由 _add_eps_cumulative_features 負責
         """
         df = self.df
 
-        # 去年累計營收
+        # ── ① 去年累計營收（FinLab 原始欄位，直接取用）─────────
         if "monthly_revenue_ly_cum" in df.columns:
             df["去年累計營收(千元)_rev"] = (df["monthly_revenue_ly_cum"] / 1000).fillna(0)
             print("    去年累計營收 ✓")
 
-        # 單月營收成長率（MoM）
+        # ── ② 單月營收成長率 MoM（FinLab 原始欄位，直接取用）───
         if "monthly_revenue_mom" in df.columns:
             df["單月營收成長率％_rev"] = df["monthly_revenue_mom"].fillna(0)
             print("    單月營收成長率 ✓")
 
-        # 近3月 / 12月累計營收成長率
-        # ⚠ monthly_revenue 為月頻 ffill 至日頻，必須先降回月頻再做 rolling，
-        #   否則 rolling(3) 會在日頻上跑，語意變成「3個交易日」而非「3個月」。
+        # ── ③ 近3月 / 近12月累計營收成長率（純日頻 rolling）────
+        # monthly_revenue：FinLab 公告日 ffill 日頻序列，可直接 rolling。
+        # rolling(63).sum()  ≈ 近 63 交易日（≈3個月）營收加總
+        # 對比 shift(63) 後的前 63 日加總 → 計算成長率
+        # ⚠ pandas 2.x groupby.apply pivot 陷阱：
+        #   若每個 group 回傳的 Series 以「共用日期索引」為 index，
+        #   pandas 會把這些 Series 展開成寬表 DataFrame。
+        #   解法：保留原始 df 整數索引，apply 結束後 reindex 對齊。
         if "monthly_revenue" in df.columns:
 
-            # ⚠ pandas 2.x groupby.apply pivot 陷阱：
-            #   若每個 group 回傳的 Series 以「共用日期索引」為 index（所有股票
-            #   交易日相同），pandas 會把這些 Series 展開成寬表 DataFrame，導致
-            #   後續 assign 觸發「Cannot set a DataFrame with multiple columns」。
-            #   解法：全程保留原始 df 整數索引，apply 結束後直接對齊原 df。
+            def _rev_growth_daily(group: pd.DataFrame) -> pd.DataFrame:
+                orig_index = group.index
+                rev = group["monthly_revenue"]   # 已是日頻，不需 set_index
 
-            def _rev_growth(group: pd.DataFrame) -> pd.DataFrame:
-                orig_index = group.index                       # 原始 df 整數索引
-                g = group.set_index("年月日")["monthly_revenue"]
-                date_idx = g.index
-                # 月頻：取每月最後一個非 NaN 值
-                m = g.resample("ME").last().dropna()
-                if len(m) < 4:
-                    out = pd.DataFrame(
+                if rev.dropna().shape[0] < _W3M:
+                    return pd.DataFrame(
                         {
                             "近3月累計營收變動率％_rev": np.nan,
                             "近12月累計營收成長率_rev":  np.nan,
                         },
                         index=orig_index,
                     )
-                    return out
-                # 近3月累計 vs 前3月累計
-                r3     = m.rolling(3, min_periods=3).sum()
-                r3_lag = r3.shift(3)
+
+                # 近 3 月（63 交易日）
+                r3     = rev.rolling(_W3M, min_periods=_W3M // 2).sum()
+                r3_lag = r3.shift(_W3M)
                 chg3   = (r3 / (r3_lag.abs() + 1e-9) - 1).clip(-2, 10)
-                # 近12月累計 vs 前12月累計
-                r12     = m.rolling(12, min_periods=6).sum()
-                r12_lag = r12.shift(12)
+
+                # 近 12 月（252 交易日）
+                r12     = rev.rolling(_W12M, min_periods=_W12M // 2).sum()
+                r12_lag = r12.shift(_W12M)
                 chg12   = (r12 / (r12_lag.abs() + 1e-9) - 1).clip(-2, 10)
-                # reindex 回日頻 ffill，再把索引還原成原始 df 整數索引
-                out = pd.DataFrame(
+
+                return pd.DataFrame(
                     {
-                        "近3月累計營收變動率％_rev": chg3.reindex(date_idx, method="ffill").to_numpy(),
-                        "近12月累計營收成長率_rev":  chg12.reindex(date_idx, method="ffill").to_numpy(),
+                        "近3月累計營收變動率％_rev": chg3.to_numpy(),
+                        "近12月累計營收成長率_rev":  chg12.to_numpy(),
                     },
                     index=orig_index,
                 )
-                return out
 
             rev_result = df.groupby("證券代碼", group_keys=False).apply(
-                _rev_growth, include_groups=False
-            )
-            # rev_result 以原始 df 整數索引對齊，reindex 確保順序一致
-            rev_result = rev_result.reindex(df.index)
-            df["近3月累計營收變動率％_rev"] = rev_result["近3月累計營收變動率％_rev"].fillna(0)
-            df["近12月累計營收成長率_rev"]  = rev_result["近12月累計營收成長率_rev"].fillna(0)
+                _rev_growth_daily, include_groups=False
+            ).reindex(df.index)
 
-            # 與歷史最低單月營收比
-            # ⚠ 需在月頻做 expanding().min()，並 shift(1) 避免分母含當月自身
-            # ⚠ resample 用 "BME"（Business Month End）確保 reindex ffill 能正確對齊
-            def _hist_low_ratio(group: pd.DataFrame) -> pd.Series:
-                orig_index = group.index                       # 原始 df 整數索引
-                g = group.set_index("年月日")["monthly_revenue"]
-                date_idx = g.index
-                if g.dropna().empty:
+            df["近3月累計營收變動率％_rev"] = (
+                rev_result["近3月累計營收變動率％_rev"].fillna(0)
+            )
+            df["近12月累計營收成長率_rev"] = (
+                rev_result["近12月累計營收成長率_rev"].fillna(0)
+            )
+            print("    近3月/12月累計營收成長率（日頻 rolling，無 resample）✓")
+
+            # ── ④ 與歷史最低單月營收比（純日頻 expanding + shift(1)）─
+            # expanding().min()：截至前一日的歷史最低值
+            # shift(1)：嚴格落後，分母絕不含當日及未來值
+            def _hist_low_ratio_daily(group: pd.DataFrame) -> pd.Series:
+                orig_index = group.index
+                rev = group["monthly_revenue"]
+                if rev.dropna().empty:
                     return pd.Series(np.nan, index=orig_index,
                                      name="與歷史最低單月營收比%_rev")
-                m = g.resample("BME").last().dropna()
-                if m.empty:
-                    return pd.Series(np.nan, index=orig_index,
-                                     name="與歷史最低單月營收比%_rev")
-                hist_min = m.expanding().min().shift(1)         # 截至上個月的歷史最低
-                ratio = (m / (hist_min.abs() + 1e-9) - 1).clip(0, 100)
-                vals = ratio.reindex(date_idx, method="ffill").to_numpy()
-                # 還原成原始 df 整數索引，避免共用日期索引被 pivot 成寬表
-                return pd.Series(vals, index=orig_index,
+                hist_min = rev.expanding().min().shift(1)   # 截至昨日歷史最低
+                ratio = (rev / (hist_min.abs() + 1e-9) - 1).clip(0, 100)
+                return pd.Series(ratio.to_numpy(), index=orig_index,
                                  name="與歷史最低單月營收比%_rev")
 
             hist_low = df.groupby("證券代碼", group_keys=False).apply(
-                _hist_low_ratio, include_groups=False
+                _hist_low_ratio_daily, include_groups=False
             )
-            # 防呆：若 pandas 仍意外回傳 DataFrame，取第一欄壓平
             if isinstance(hist_low, pd.DataFrame):
                 hist_low = hist_low.iloc[:, 0]
             df["與歷史最低單月營收比%_rev"] = hist_low.reindex(df.index).fillna(0)
-            print("    月營收衍生特徵（3m/12m成長率月頻正確版 / 歷史最低比月頻+shift）✓")
+            print("    與歷史最低單月營收比（日頻 expanding min + shift(1)）✓")
 
-        # 單月每股營收
+        # ── ⑤ 單月每股營收 ───────────────────────────────────────
         if all(c in df.columns for c in ["monthly_revenue", "fii_shares"]):
             df["單月每股營收(元)_rev"] = (
                 df["monthly_revenue"] / (df["fii_shares"] + 1e-9)
             ).fillna(0)
             print("    單月每股營收 ✓")
 
-        # EPS 衍生
+        # ── ⑥ 單月每股稅後盈餘（直接取用）──────────────────────
+        # ⚠ TTM 累計 EPS 與 累計稅後盈餘成長率％_rev 已移至
+        #   _add_eps_cumulative_features，避免稀疏 eps 在日頻 rolling(4) 的語意錯誤
         if "eps" in df.columns:
             df["單月每股稅後盈餘(WA)_rev"] = df["eps"].fillna(0)
-
-            # 累計 EPS YoY 成長率（TTM / TTM shift 252 trading days）
-            ttm = df.groupby("證券代碼")["eps"].transform(
-                lambda x: x.rolling(4, min_periods=2).sum()  # 4季 TTM
-            )
-            ttm_lag = df.groupby("證券代碼")["eps"].transform(
-                lambda x: x.rolling(4, min_periods=2).sum().shift(4)
-            )
-            df["累計稅後盈餘成長率％_rev"] = (
-                (ttm / (ttm_lag.abs() + 1e-9) - 1).clip(-2, 10).fillna(0)
-            )
-            print("    EPS 衍生特徵 ✓")
+            print("    單月每股稅後盈餘(WA)_rev ✓（TTM 成長率見 _add_eps_cumulative_features）")
 
         self.df = df.copy()   # 整合碎片化欄位
 
@@ -1039,17 +1058,29 @@ class FeatureMixin:
 
     def _add_excess_return_features(self):
         """
-        報酬率1       = adj_close.pct_change()（日簡單報酬率）
-        超額報酬日大盤 = 個股日報酬 - 大盤日報酬
-        超額報酬週大盤 = 個股週報酬 - 大盤週報酬
+        報酬率1       = adj_close.pct_change()（日簡單報酬率，backward）
+        超額報酬日大盤 = 個股日報酬 - 大盤日報酬（backward）
+        超額報酬週大盤 = 個股 WTD 報酬 - 大盤 WTD 報酬（backward，到當日為止）
 
         ⚠ 依賴 market_return；需在 benchmark 計算後呼叫。
         ⚠ 報酬率1 與 daily_return 含義相同，另存此欄遵循 finlab_dataset_check.csv 規範。
+
+        ─────────────────────────────────────────────
+        ★ 2026-06-23 look-ahead 修正（超額報酬週大盤）
+        ─────────────────────────────────────────────
+          舊版以 groupby(週).transform("last") 取「當週最後一日（週五）收盤」，
+          並賦值給該週每一列 → 週一~週四的列含有未來收盤（最多 T+4），
+          且 label excess_return_tick 的報酬視窗 open[T+1]→open[T+2] 落在同一週內
+          → 直接洩漏 label（leak_probe.py Part A 會以 ★★★/★★ 命中）。
+          現改為 week-to-date（WTD）：
+            個股腳：分子用「當列收盤 group[_CLOSE]」而非整週最後收盤；
+            大盤腳：用 cumprod（週內到當日的累乘）而非整週 prod。
+          兩腳皆只用「週起點 ~ 當日」資訊，無未來函數。
         """
         if not self._require_cols(_CLOSE, "market_return"):
             return False
 
-        # ① 日簡單報酬率
+        # ① 日簡單報酬率（backward）
         self.df["報酬率1"] = (
             self.df.groupby("證券代碼")[_CLOSE]
             .transform(lambda x: x.pct_change(fill_method=None))
@@ -1057,21 +1088,22 @@ class FeatureMixin:
             .fillna(0)
         )
 
-        # ② 超額報酬日大盤
+        # ② 超額報酬日大盤（backward）
         self.df["超額報酬日大盤"] = (
             self.df["報酬率1"] - self.df["market_return"]
         ).fillna(0)
 
-        # ③ 超額報酬週大盤（週首末收盤報酬 vs 大盤週複利報酬）
+        # ③ 超額報酬週大盤（WTD：週起點 → 當日，無未來函數）
         def _weekly_excess(group):
             wk = group["年月日"].dt.to_period("W")
-            first_c = group.groupby(wk)[_CLOSE].transform("first")
-            last_c  = group.groupby(wk)[_CLOSE].transform("last")
-            stock_w = last_c / (first_c + 1e-9) - 1
-            mkt_w   = group.groupby(wk)["market_return"].transform(
-                lambda x: (1 + x).prod() - 1
+            # 個股：當列收盤 / 當週第一日收盤 - 1（到當日為止的 WTD）
+            first_c   = group.groupby(wk)[_CLOSE].transform("first")
+            stock_wtd = group[_CLOSE] / (first_c + 1e-9) - 1
+            # 大盤：週內 expanding 累乘（cumprod），同樣只到當日
+            mkt_wtd   = group.groupby(wk)["market_return"].transform(
+                lambda x: (1 + x).cumprod() - 1
             )
-            return (stock_w - mkt_w).fillna(0)
+            return (stock_wtd - mkt_wtd).fillna(0)
 
         self.df["超額報酬週大盤"] = (
             self.df.groupby("證券代碼", group_keys=False)
@@ -1079,7 +1111,7 @@ class FeatureMixin:
             .reset_index(level=0, drop=True)
             .fillna(0)
         )
-        print("    報酬率1 / 超額報酬日大盤 / 超額報酬週大盤 ✓")
+        print("    報酬率1 / 超額報酬日大盤 / 超額報酬週大盤(WTD, 無未來) ✓")
 
     # ──────────────────────────────────────────────────────────
     #  【新增】估值特徵
@@ -1113,76 +1145,103 @@ class FeatureMixin:
 
     def _add_eps_cumulative_features(self):
         """
-        累計每股稅後盈餘(WA)_rev = TTM EPS（trailing-twelve-month 4季加總）
-        去年累計稅前盈餘_rev      = 上一完整年度 4季稅前淨利合計
+        累計 EPS / 稅前盈餘特徵（純日頻 rolling，無 resample("QE")）
 
-        資料特性（2025.csv 實測）：
-            eps          → 稀疏型（公告日才有值，非連續）
-            pretax_profit→ 已 ffill（季頻 4–5 次更新後 ffill 至日頻）
+        欄位說明：
+          累計每股稅後盈餘(WA)_rev  TTM EPS ≈ rolling(252).sum()（≈4季）
+          累計稅後盈餘成長率％_rev   TTM YoY = TTM / TTM.shift(252) - 1
+          去年累計稅前盈餘_rev       ≈ rolling(252).sum().shift(252)
 
-        計算策略：
-            Step 1：per-stock ffill
-            Step 2：resample QE .last() 取各季末代表值
-            Step 3：rolling(4).sum() for TTM
-                   groupby(year).sum().shift(1 year) for 去年全年
-            Step 4：reindex 回日頻 + ffill
+        資料特性：
+          eps          → make.py preprocess 已做 per-stock ffill（進入此方法時為日頻連續值）
+          pretax_profit→ 同上，已 ffill 至日頻
+
+        修正重點（2026-06，真實 lookahead bug）：
+          原始問題：
+            eps.ffill() → resample("QE").last()
+            稀疏 eps 在公告日（如 11/14）公告 Q3 EPS → ffill 覆蓋 Q3 季末 9/30
+            → resample("QE").last() 取 9/30 的值 = 11/14 公告數字
+            → 模型在 9/30 就看到了 11/14 的 EPS → 嚴重穿越 ✗
+
+          修正策略：
+            eps 進入時已是日頻連續值（preprocess ffill），
+            shift(1) 確保公告當日不可用（隔日才生效），
+            再 ffill 補齊 shift 產生的第一列 NaN，
+            rolling(252, min_periods=63).sum() ≈ TTM 4 季加總。
+
+          ⚠ min_periods=63（≈1季）容許早期 warmup 不足時仍輸出部分值；
+            若要求嚴格 4 季完整，改為 min_periods=252。
         """
         df = self.df
 
-        # ─── 累計每股稅後盈餘(WA)_rev（TTM）────────────────────
+        # ── ① TTM EPS & YoY 成長率 ──────────────────────────────
         if "eps" in df.columns:
 
-            # ⚠ 同 _add_fundamental_features：apply 必須回傳「原始 df 整數索引」
-            #   的 Series，否則共用日期索引會被 pandas pivot 成寬表 DataFrame。
-            def _ttm_eps(group: pd.DataFrame) -> pd.Series:
+            def _ttm_eps_daily(group: pd.DataFrame) -> pd.DataFrame:
+                """
+                eps 進入時已是 preprocess ffill 的日頻連續值。
+                shift(1)：公告當日不可用，隔日才生效。
+                ffill()：補齊 shift(1) 產生的第一列 NaN（保持日頻連續）。
+                rolling(252).sum() ≈ TTM 4 季加總。
+                """
                 orig_index = group.index
-                g = group.set_index("年月日")["eps"]
-                date_idx = g.index
-                g_filled = g.ffill()
-                q_vals = g_filled.resample("QE").last().dropna()
-                if q_vals.empty:
-                    return pd.Series(np.nan, index=orig_index,
-                                     name="累計每股稅後盈餘(WA)_rev")
-                ttm = q_vals.rolling(4, min_periods=4).sum()
-                vals = ttm.reindex(date_idx, method="ffill").to_numpy()
-                return pd.Series(vals, index=orig_index,
-                                 name="累計每股稅後盈餘(WA)_rev")
+                eps_safe = group["eps"].shift(1).ffill()
 
-            ttm_result = df.groupby("證券代碼", group_keys=False).apply(
-                _ttm_eps, include_groups=False
+                ttm     = eps_safe.rolling(_W12M, min_periods=_W3M).sum()
+                ttm_lag = ttm.shift(_W12M)    # 去年同期 TTM
+                yoy     = (ttm / (ttm_lag.abs() + 1e-9) - 1).clip(-2, 10)
+
+                return pd.DataFrame(
+                    {
+                        "累計每股稅後盈餘(WA)_rev": ttm.to_numpy(),
+                        "累計稅後盈餘成長率％_rev":  yoy.to_numpy(),
+                    },
+                    index=orig_index,
+                )
+
+            eps_result = df.groupby("證券代碼", group_keys=False).apply(
+                _ttm_eps_daily, include_groups=False
             )
-            if isinstance(ttm_result, pd.DataFrame):   # 防呆壓平
-                ttm_result = ttm_result.iloc[:, 0]
-            df["累計每股稅後盈餘(WA)_rev"] = ttm_result.reindex(df.index).fillna(0)
-            print("    累計每股稅後盈餘(WA)_rev (TTM 4Q) ✓")
+            if isinstance(eps_result, pd.Series):    # 防呆壓平
+                eps_result = eps_result.to_frame()
+            eps_result = eps_result.reindex(df.index)
+            df["累計每股稅後盈餘(WA)_rev"] = (
+                eps_result["累計每股稅後盈餘(WA)_rev"].fillna(0)
+            )
+            df["累計稅後盈餘成長率％_rev"] = (
+                eps_result["累計稅後盈餘成長率％_rev"].fillna(0)
+            )
+            print("    累計每股稅後盈餘(WA)_rev（TTM rolling252 shift(1)）✓")
+            print("    累計稅後盈餘成長率％_rev（TTM YoY）✓")
 
-        # ─── 去年累計稅前盈餘_rev（上一完整年度合計）──────────
+        # ── ② 去年累計稅前盈餘（上一完整年度代理值）────────────
+        # rolling(252).sum()        ≈ 過去 1 年稅前盈餘合計（TTM）
+        # .shift(252)               ≈ 再往前推 1 年 = 去年全年合計
+        # 語意與原始「上一完整年度 4 季合計」高度等效，且無 resample 邊界問題。
         if "pretax_profit" in df.columns:
 
-            def _prev_year_pretax(group: pd.DataFrame) -> pd.Series:
+            def _prev_year_pretax_daily(group: pd.DataFrame) -> pd.Series:
                 orig_index = group.index
-                g = group.set_index("年月日")["pretax_profit"]
-                date_idx = g.index
-                g_filled = g.ffill()
-                q_vals = g_filled.resample("QE").last().dropna()
-                if q_vals.empty:
-                    return pd.Series(np.nan, index=orig_index,
-                                     name="去年累計稅前盈餘_rev")
-                # 各年合計
-                annual = q_vals.groupby(q_vals.index.year).sum()
-                vals = np.array(
-                    [annual.get(y - 1, np.nan) for y in date_idx.year],
-                    dtype=float,
+                # shift(1)：季報公告當日不可用；ffill：補齊 shift 產生的 NaN
+                pt_safe = group["pretax_profit"].shift(1).ffill()
+                prev_annual = (
+                    pt_safe.rolling(_W12M, min_periods=_W3M).sum()
+                           .shift(_W12M)
                 )
-                return pd.Series(vals, index=orig_index,
-                                 name="去年累計稅前盈餘_rev")
+                return pd.Series(
+                    prev_annual.to_numpy(),
+                    index=orig_index,
+                    name="去年累計稅前盈餘_rev",
+                )
 
             pretax_result = df.groupby("證券代碼", group_keys=False).apply(
-                _prev_year_pretax, include_groups=False
+                _prev_year_pretax_daily, include_groups=False
             )
-            if isinstance(pretax_result, pd.DataFrame):   # 防呆壓平
+            if isinstance(pretax_result, pd.DataFrame):    # 防呆壓平
                 pretax_result = pretax_result.iloc[:, 0]
-            df["去年累計稅前盈餘_rev"] = pretax_result.reindex(df.index).fillna(0)
-            print("    去年累計稅前盈餘_rev ✓")
+            df["去年累計稅前盈餘_rev"] = (
+                pretax_result.reindex(df.index).fillna(0)
+            )
+            print("    去年累計稅前盈餘_rev（rolling252 shift252 + shift(1)）✓")
 
         self.df = df.copy()   # 整合碎片化欄位
