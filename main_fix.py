@@ -40,6 +40,17 @@ Walk-Forward Pipeline 入口（靜態研究版・固定超參數版）。
   訓練之外；static 端的 model._resolve_features 會把所有數值欄當特徵 →
   於 run_ml() 啟動 trainer 前擴充 objective.model._EXCLUDE_COLS（不改 model.py）。
 
+─────────────────────────────────────────────
+  ★ 2026-06-23：新增 size/price 外部條件變數排除
+─────────────────────────────────────────────
+  為研究「市值(size) / 股價(price) × 模型訊號」對報酬的交互效果，
+  make_new.py 已把 market_value、close 保留進 database_make/YYYY.csv。
+  這兩欄屬【模型外部的 conditioning variable】，**不可進訓練**——
+  否則模型直接學到 size/price，交互分析淪為循環論證（模型本就看了 size，
+  再問它的 edge 是否隨 size 變化，訊號被自己吃掉）。
+  故於 EXTRA_EXCLUDE_COLS 一併排除（與 amount 同性質：保留於 CSV、排除於訓練）。
+  下游 interaction.py 以這兩欄作為 conditioning 軸。
+
 執行方式：
     python main_fix.py
 
@@ -133,7 +144,10 @@ class RunConfig:
     ALIGN_FEATURES_WITH_LIVE = True
     EXTRA_EXCLUDE_COLS = {
         "amount",              # 成交金額：daily 僅作流動性過濾，不進訓練
-        "market_return_fwd",   # 前視 T+1：防呆（目前不在 database_make/ 輸出）
+        "market_value",        # ★ size proxy：外部條件變數（size×model 交互分析），不進訓練
+        "close",               # ★ price proxy：外部條件變數（price×model 交互分析），不進訓練
+        "market_return_fwd",   # ★ 前視 T+1→T+2：2026-06-25 起保留於 database_make/ 輸出
+                                #   （供 backtest.py 對齊大盤用),訓練端仍須排除,防 look-ahead
         "market_index",        # 與 model._EXCLUDE_COLS 既有項目對齊（idempotent）
     }
 

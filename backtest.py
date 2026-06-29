@@ -11,8 +11,10 @@ Walk-Forward 回測模組。
         欄位：證券代碼, 年月日, return, y_true, y_prob, y_pred
         return = 明日開盤 → 後日開盤（已排除 look-ahead bias）
 
-    database_make/market_return_series.csv  （由 test.py 產生）
-        或直接從 database_make/*.csv 讀取 market_return 欄位
+    database_make/market_return_series.csv  （由 test.py 產生，需重新產生含 market_return_fwd 欄）
+        或直接從 database_make/*.csv 讀取 market_return_fwd 欄位
+        ★ 2026-06-25：改用 market_return_fwd（open[T+1]→open[T+2]),
+          與 return 同窗對齊,取代舊版時間錯位的 market_return（close-to-close, lag-0）
 
   [處理 Process]
     1. 讀取所有 window 的 predictions.csv 並合併
@@ -20,14 +22,14 @@ Walk-Forward 回測模組。
     3. 每個交易日依 y_prob 排序，分成 10 個 Decile 組
        Decile 1 = y_prob 最高（最看漲）
     4. 計算各組每日等權報酬，乘以資金使用率（CAPITAL_USAGE）
-    5. 載入 market_return，對齊日期
-    6. 計算 excess_return = D1_scaled - market_return
+    5. 載入 market_return_fwd，對齊日期
+    6. 計算 excess_return = D1_scaled - market_return_fwd
     7. 輸出指標（含 alpha / IR）與圖表
 
   [資金使用率 Capital Usage]
     CAPITAL_USAGE = 0.5 表示 50% 資金投入股票，50% 閒置（報酬=0）
     所有 Decile return 均乘以 CAPITAL_USAGE
-    market_return 保持原始（代表 100% 持有大盤）
+    market_return_fwd 保持原始（代表 100% 持有大盤）
     → 比較時需注意 benchmark 與策略的槓桿差異
 
   [輸出 Output]
@@ -139,7 +141,13 @@ BETA_WINDOW       = 252      # rolling 視窗（交易日）
 BETA_MIN_PERIODS  = 60       # 估計 β 所需最少樣本
 
 DATE_COL = "年月日"
-MKT_COL  = "market_return"
+# ★ 2026-06-25：改用 market_return_fwd（open[T+1]→open[T+2]）。
+#   舊版 market_return 是「第 T 天 close-to-close 的大盤報酬」,
+#   但 predictions.csv 的 return 是「open[T+1]→open[T+2]」的策略持倉報酬,
+#   兩者時間窗不對齊（lag 且 close/open 基準不同）。
+#   market_return_fwd 公式與策略 return 完全同構（皆為 open-to-open,同一窗口),
+#   對齊後才能算出真正乾淨的 excess_return / alpha。
+MKT_COL  = "market_return_fwd"
 
 
 # ============================================================
@@ -176,8 +184,12 @@ def load_all_predictions(exp_dir: Path) -> pd.DataFrame:
 
 def load_market_return(db_make_dir: Path) -> pd.Series:
     """
-    載入大盤日報酬序列。優先讀取 test.py 產生的 market_return_series.csv；
+    載入大盤日報酬序列（market_return_fwd, open[T+1]→open[T+2],與策略 return 同窗對齊）。
+    優先讀取 test.py 產生的 market_return_series.csv；
     若不存在則直接從 db_make_dir/*.csv 提取（取各檔第一次出現的值）。
+
+    ⚠ 若舊版 market_return_series.csv 仍是舊欄位（無 market_return_fwd),
+      需先重跑 test.py / make_new.py 重新產生,否則 fallback 會找不到欄位而報錯。
     """
     cached = db_make_dir / "market_return_series.csv"
     if cached.exists():
@@ -279,11 +291,11 @@ def daily_returns(
     capital_usage : float
         資金使用率，e.g. 0.5 代表 50% 資金投入、50% 現金閒置。
         策略報酬 = raw_decile_return × capital_usage
-        market_return 保持原始（100% 持有大盤作為 benchmark）
+        market_return_fwd 保持原始（100% 持有大盤作為 benchmark）
 
     新增欄位
     --------
-    market      : 大盤日報酬（原始，不乘 capital_usage）
+    market      : 大盤同窗報酬（market_return_fwd, open[T+1]→open[T+2], 原始，不乘 capital_usage）
     excess_D1   : D1（scaled） - market
     """
     cost = cost_bps / 10_000 * 2
@@ -304,7 +316,7 @@ def daily_returns(
 
     n_missing = ret["market"].isna().sum()
     if n_missing > 0:
-        print(f"  [WARN] market_return 缺少 {n_missing} 天（已設為 NaN，不影響 Decile 計算）")
+        print(f"  [WARN] market_return_fwd 缺少 {n_missing} 天（已設為 NaN，不影響 Decile 計算）")
 
     # excess return（D1 scaled - market）
     if "D1" in ret.columns:

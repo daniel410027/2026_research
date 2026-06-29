@@ -1002,7 +1002,12 @@ class FeatureMixin:
             excess_return    : return − beta × market_return_fwd
             excess_return_tick
 
-        ⚠ market_return_fwd 在本步驟後強制 drop。
+        ★ 2026-06-25：market_return_fwd 改為保留（不再強制 drop）。
+          原因：backtest.py 需要這個欄位作為「與策略 return 同窗（open[T+1]→open[T+2]）
+          對齊」的大盤 benchmark,單純 drop 掉會讓 backtest.py 拿不到正確對齊的大盤序列。
+          look-ahead 防護改由訓練端負責：main_fix.py 的 EXTRA_EXCLUDE_COLS 已將
+          market_return_fwd 排除於模型訓練特徵之外（與 amount / market_value / close
+          同樣是「保留於 CSV、不進訓練」的 conditioning / benchmark 欄位）。
         """
         if not self._require_cols(_OPEN, "market_return_fwd", "beta"):
             return False
@@ -1040,10 +1045,6 @@ class FeatureMixin:
             np.nan,
         )
 
-        # ⚠ drop market_return_fwd（look-ahead bias 防護）
-        self.df = self.df.drop(columns=["market_return_fwd"], errors="ignore")
-        print("  market_return_fwd dropped（look-ahead bias 防護）")
-
         pos_rate        = (self.df["return_tick"]        == 1).sum() / valid.sum()
         pos_rate0       = (self.df["return_tick_0"]      == 1).sum() / valid.sum()
         pos_excess_rate = (self.df["excess_return_tick"] == 1).sum() / excess_valid.sum()
@@ -1051,6 +1052,8 @@ class FeatureMixin:
         print(f"  return_tick        (>{cfg.tick_threshold:.1%}) 正樣本率: {pos_rate:.2%}")
         print(f"  return_tick_0      (>{cfg.tick0_threshold:.1%}) 正樣本率: {pos_rate0:.2%}")
         print(f"  excess_return_tick (>{cfg.tick_threshold:.1%}) 正樣本率: {pos_excess_rate:.2%}")
+        print("  market_return_fwd 保留（訓練端由 main_fix.py EXTRA_EXCLUDE_COLS 排除）")
+
 
     # ──────────────────────────────────────────────────────────
     #  【新增】超額報酬特徵
