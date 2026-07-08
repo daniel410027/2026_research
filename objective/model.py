@@ -90,6 +90,12 @@ _EXCLUDE_COLS = {
     #         純為防止未來 schema 新增時的靜默 train/serve 漂移。
     "amount",            # 成交金額：僅作流動性過濾，不進訓練
     "market_return_fwd", # 前視 T+1：label 建構用，防呆排除
+    # [2026-07-08] 市場別：make_new.py 自 market_type.csv merge 進來的靜態字串欄
+    #   （sii/otc/rotc），供 live 端 universe 過濾與檢視用。目前因 object dtype
+    #   會被 _resolve_features 的 is_numeric_dtype 靜默濾掉，但該防線依賴 dtype
+    #   巧合——若未來被 encode 成數值即無聲進入特徵集。顯式排除以固定意圖。
+    #   （panel 已經 sii 篩選，此欄近乎常數，本無訓練價值。）
+    "市場別",
 }
 
 
