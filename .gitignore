@@ -5,3 +5,4 @@ output
 
 database*
 __pycache__/
+.DS_Store
