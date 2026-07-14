@@ -15,7 +15,7 @@ WalkForwardTrainer（model.py）與 DailyTrainer（daily_model.py）
 
     [2025 更新] 新增 collect_oof_prob：
     - 超參數凍結模式下，跳過 Optuna，只用固定參數跑 CV 收集 OOF prob
-    - 供 find_threshold 使用，耗時約為 tune_lgb 的 1/n_trials
+    - 供 evaluate_oof_ic 監控使用，耗時約為 tune_lgb 的 1/n_trials
 
     [2026 修正] CV 切折以「唯一交易日」為單位（date-aware）：
     - 問題①：上游 train_df 若為 stock-major 排序，row-based TimeSeriesSplit
@@ -25,8 +25,8 @@ WalkForwardTrainer（model.py）與 DailyTrainer（daily_model.py）
               外洩。本版改為以唯一交易日為切分單位（_make_cv_folds），確保同一天
               的所有股票完整落在同一側。
     - 問題③：TimeSeriesSplit 最早一段樣本永遠不在任何 valid fold，舊版 OOF 以
-              0 初始化，使這些列被 find_threshold 當成「預測為負」而污染門檻。
-              本版 OOF 改以 NaN 初始化，find_threshold 自動略過未預測列。
+              0 初始化，使這些列被誤計入下游評估。
+              本版 OOF 改以 NaN 初始化，evaluate_oof_ic 自動略過未預測列。
 
     向後相容：dates 為 None 時退回傳統 row-based TimeSeriesSplit
               （DailyTrainer 若未傳 dates，行為與舊版一致）。
@@ -35,7 +35,7 @@ WalkForwardTrainer（model.py）與 DailyTrainer（daily_model.py）
     tune_lgb          Optuna TPE 調參 + OOF prob 收集
     collect_oof_prob  固定超參數下只收集 OOF prob（凍結模式用）
     train_final_lgb   最終模型訓練（全量 X_train）
-    find_threshold    OOF F1 最佳 threshold 搜尋（自動略過 NaN）
+    evaluate_oof_ic   OOF Spearman IC 監控（自動略過 NaN，不做 threshold）
     build_imp_df      特徵重要性 DataFrame（gain）
 
 作者：Daniel Huang
@@ -49,7 +49,7 @@ import lightgbm as lgb
 import numpy as np
 import optuna
 import pandas as pd
-from sklearn.metrics import f1_score, log_loss
+from scipy.stats import spearmanr
 from sklearn.model_selection import TimeSeriesSplit
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -61,8 +61,8 @@ warnings.filterwarnings("ignore")
 # ============================================================
 
 _LGB_BASE_PARAMS = {
-    "objective":     "binary",
-    "metric":        "binary_logloss",
+    "objective":     "regression",
+    "metric":        "rmse",
     "verbosity":     -1,
     "boosting_type": "gbdt",
 }
@@ -167,7 +167,7 @@ def tune_lgb(
     Optuna TPE 調參 + 最佳參數 OOF prob 收集（date-aware CV）。
 
     最佳參數確定後，只再跑一輪 CV 收集 OOF prob，
-    供 find_threshold 使用，不額外增加訓練負擔。
+    供 evaluate_oof_ic 監控使用，不額外增加訓練負擔。
 
     [2026-06 更新] return_best_iters=True 時：
     - OOF 收集改用「1000 輪 + ES(50)」（與 objective 內的訓練方式一致），
@@ -195,7 +195,7 @@ def tune_lgb(
     oof_prob    : np.ndarray   ── OOF 預測機率（未被任何 valid fold 命中者為 NaN）
     best_iters  : list[int]    ── 僅 return_best_iters=True 時
     best_fold_losses : list[float] ── 僅 return_cv_details=True 時，
-                        最佳超參數組合在 Optuna 搜尋當下、各折的 binary_logloss
+                        最佳超參數組合在 Optuna 搜尋當下、各折的 RMSE
                         （與 objective() 內計算方式一致，用於 cv_metrics.json）
     """
     cv_folds = _make_cv_folds(X_train, n_splits, dates)
@@ -226,11 +226,10 @@ def tune_lgb(
                 ],
                 callbacks=[lgb.early_stopping(50, verbose=False)],
             )
-            prob = np.clip(
-                m.predict(X_train.iloc[va_idx], num_iteration=m.best_iteration),
-                1e-7, 1 - 1e-7,
+            pred = m.predict(X_train.iloc[va_idx], num_iteration=m.best_iteration)
+            fold_losses.append(
+                float(np.sqrt(np.mean((y_train.iloc[va_idx].to_numpy() - pred) ** 2)))
             )
-            fold_losses.append(log_loss(y_train.iloc[va_idx], prob))
         # ★ 存進 trial user_attrs，供搜尋結束後從 study.best_trial 撈出，
         #   不需重新訓練即可取得最佳超參數當下的逐折 CV logloss。
         trial.set_user_attr("fold_losses", fold_losses)
@@ -243,7 +242,7 @@ def tune_lgb(
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     best_params = study.best_params
     best_fold_losses = list(study.best_trial.user_attrs.get("fold_losses", []))
-    print(f"  Best CV log-loss: {study.best_value:.6f}")
+    print(f"  Best CV RMSE: {study.best_value:.6f}")
 
     # ── 最佳參數 OOF prob ────────────────────────────────────
     if return_best_iters:
@@ -310,7 +309,7 @@ def collect_oof_prob(
     -------
     oof_prob : np.ndarray  ── 與 y_train 等長；
                最早一段（從不在任何 valid fold）保持 NaN，
-               由 find_threshold 自動略過，避免污染門檻搜尋。
+               由 evaluate_oof_ic 自動略過，避免污染 IC 計算。
     best_iters : list[int]（僅 return_best_iters=True 時）
                每折的 best_iteration（無 ES 時為 num_boost_round）。
     """
@@ -386,35 +385,32 @@ def train_final_lgb(
     )
 
 
-def find_threshold(y_true: pd.Series, oof_prob: np.ndarray) -> float:
+def evaluate_oof_ic(y_true: pd.Series, oof_pred: np.ndarray) -> float:
     """
-    在 [0.05, 0.70) 以 0.01 為步距搜尋，最大化 OOF F1 的 threshold。
+    計算 OOF 預測值與真實值的 Spearman IC（rank correlation），供監控用。
 
-    自動略過 oof_prob 為 NaN 的列（最早一段未被任何 valid fold 命中者），
-    避免將「未預測」誤計為「預測為負」而污染門檻。
+    自動略過 oof_pred 為 NaN 的列（最早一段未被任何 valid fold 命中者），
+    避免將「未預測」誤計入 IC 計算。
+
+    不做 threshold 搜尋——regression target 下沒有天然的 0/1 切點，
+    改用 IC 監控模型排序品質，實際選股門檻交由呼叫端（如 decile / top-K）決定。
 
     Returns
     -------
-    float  ── 最佳 threshold（四捨五入至小數點後 2 位）
+    float  ── Spearman IC（rank correlation），無有效樣本時回傳 np.nan
     """
     y_true   = np.asarray(y_true)
-    oof_prob = np.asarray(oof_prob, dtype=float)
+    oof_pred = np.asarray(oof_pred, dtype=float)
 
-    mask = ~np.isnan(oof_prob)
+    mask = ~np.isnan(oof_pred)
     n_valid = int(mask.sum())
     if n_valid == 0:
-        print("  ⚠ 無有效 OOF 機率，threshold 退回 0.5")
-        return 0.5
-    y_true   = y_true[mask]
-    oof_prob = oof_prob[mask]
+        print("  ⚠ 無有效 OOF 預測值，IC 無法計算")
+        return float("nan")
 
-    best_thresh, best_f1 = 0.5, 0.0
-    for thresh in np.arange(0.05, 0.70, 0.01):
-        f1 = f1_score(y_true, (oof_prob >= thresh).astype(int), zero_division=0)
-        if f1 > best_f1:
-            best_f1, best_thresh = f1, thresh
-    print(f"  Best threshold: {best_thresh:.2f}  (OOF F1={best_f1:.4f}, n={n_valid:,})")
-    return round(float(best_thresh), 2)
+    ic, _ = spearmanr(y_true[mask], oof_pred[mask])
+    print(f"  OOF Spearman IC: {ic:.4f}  (n={n_valid:,})")
+    return float(ic)
 
 
 def build_imp_df(model: lgb.Booster, feature_cols: list[str]) -> pd.DataFrame:

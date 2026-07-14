@@ -53,13 +53,11 @@ from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from sklearn.metrics import (
-    accuracy_score, f1_score, log_loss,
-    precision_score, recall_score, roc_auc_score,
-)
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from scipy.stats import spearmanr
 
 from .lgb_utils import (
-    tune_lgb, train_final_lgb, find_threshold, build_imp_df, collect_oof_prob,
+    tune_lgb, train_final_lgb, evaluate_oof_ic, build_imp_df, collect_oof_prob,
 )
 
 # preprocess 僅在 inject_cache 路徑使用，lazy import 避免 __init__.py 問題
@@ -76,13 +74,21 @@ warnings.filterwarnings("ignore")
 
 _FEATURES_CSV_PATH = Path("database/features_only.csv")
 
-_NEW_FEATURES = ["beta", "vol20", "daily_return", "market_return",
+_NEW_FEATURES = ["beta", "vol20", "daily_return",
                  "CAPM_Beta一月", "CAPM_Beta九月", "CAPM_Beta一年"]
 
 _EXCLUDE_COLS = {
     "證券代碼", "年月日", "market_index",
     "return", "return_tick", "return_tick_0",
     "excess_return", "excess_return_tick",
+    # [2026-07-14] market_return：backward 大盤日報酬（T-1→T 收盤），時序上無
+    #   look-ahead，但為 per-day constant——同日所有股票值相同，等同「日期指紋」。
+    #   Pooled panel 訓練下樹模型可據此辨識特定日期、記憶該日平均 excess return
+    #   （兩年 train 僅 ~490 個唯一交易日，date-level conditioning 極易過擬合）；
+    #   對每日 cross-sectional decile 排序無直接資訊。有用的交互版本
+    #   （超額報酬日大盤/週大盤、beta）已在特徵集，原始值屬冗餘。
+    #   欄位仍保留於 database_make/ CSV（make 階段的 beta/超額報酬計算依賴它）。
+    "market_return",
     # [2026-06 對齊 live] 以下兩欄納入 base，使 WF 與 daily_model.py 共用同一訓練特徵集。
     #   排除邏輯自此集中於本模組，不再依賴各進入點（main.py / main_fix.py）以
     #   EXTRA_EXCLUDE_COLS 擴充；其既有 union 變為 idempotent 冗餘，可保留不動。
@@ -128,7 +134,7 @@ class WalkForwardConfig:
     window_end:   int = 2025
 
     # ── 目標欄位 ──────────────────────────────────────────────
-    target_col: str = "excess_return_tick"
+    target_col: str = "excess_return"
 
     # ── 特徵設定 ──────────────────────────────────────────────
     use_features_csv: bool = False
@@ -292,11 +298,13 @@ class WalkForwardTrainer:
 
         print(
             f"  Train {train_years}: {len(train_df):,} 筆  "
-            f"正例率 {train_df[self.cfg.target_col].mean():.3f}"
+            f"mean={train_df[self.cfg.target_col].mean():.5f}  "
+            f"std={train_df[self.cfg.target_col].std():.5f}"
         )
         print(
             f"  Test  {test_year} : {len(test_df):,} 筆  "
-            f"正例率 {test_df[self.cfg.target_col].mean():.3f}"
+            f"mean={test_df[self.cfg.target_col].mean():.5f}  "
+            f"std={test_df[self.cfg.target_col].std():.5f}"
         )
 
         if len(train_df) == 0 or len(test_df) == 0:
@@ -320,7 +328,7 @@ class WalkForwardTrainer:
 
         if do_tune:
             print(f"  [Optuna] 執行超參數搜尋（{self.cfg.n_trials} trials）...")
-            best_params, oof_prob = tune_lgb(
+            best_params, oof_pred = tune_lgb(
                 X_train, y_train,
                 n_splits      = self.cfg.n_splits,
                 n_trials      = self.cfg.n_trials,
@@ -333,8 +341,8 @@ class WalkForwardTrainer:
                 print(f"  [Optuna] 超參數已凍結，後續 fold 沿用")
         else:
             best_params = self._frozen_params
-            print(f"  [Optuna] 沿用凍結超參數，跳過 tune，只收集 OOF prob")
-            oof_prob = collect_oof_prob(
+            print(f"  [Optuna] 沿用凍結超參數，跳過 tune，只收集 OOF 預測值")
+            oof_pred = collect_oof_prob(
                 X_train, y_train,
                 best_params   = best_params,
                 n_splits      = self.cfg.n_splits,
@@ -345,16 +353,16 @@ class WalkForwardTrainer:
         print("  訓練最終模型...")
         model = train_final_lgb(X_train, y_train, best_params, train_weight)
 
-        best_threshold = find_threshold(y_train, oof_prob)
+        oof_ic = evaluate_oof_ic(y_train, oof_pred)
 
         metrics, pred_df, imp_df = self._evaluate(
-            model, X_test, y_test, feature_cols, test_df, best_threshold
+            model, X_test, y_test, feature_cols, test_df
         )
         metrics.update({
             "window":             f"{start}_{end}",
             "train_years":        str(train_years),
             "test_year":          test_year,
-            "threshold":          best_threshold,
+            "oof_ic":             oof_ic,
             "vol_weight_used":    train_weight is not None,
             "vol_weight_col":     self.cfg.vol_weight_col if train_weight is not None else None,
             "hyperparams_tuned":  do_tune,   # 本 fold 是否重新 tune
@@ -364,7 +372,7 @@ class WalkForwardTrainer:
         out_dir.mkdir(parents=True, exist_ok=True)
         self._save_outputs(out_dir, metrics, best_params, pred_df, imp_df)
 
-        print(f"  AUC={metrics['roc_auc']:.4f}  F1={metrics['f1']:.4f}  → {out_dir}")
+        print(f"  Test IC={metrics['ic']:.4f}  RMSE={metrics['rmse']:.6f}  → {out_dir}")
         return metrics
 
     def _resolve_features(self, df: pd.DataFrame) -> list[str]:
@@ -405,26 +413,21 @@ class WalkForwardTrainer:
         y_test:       pd.Series,
         feature_cols: list[str],
         test_df:      pd.DataFrame,
-        threshold:    float,
     ) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
-        y_prob = np.clip(model.predict(X_test), 1e-7, 1 - 1e-7)
-        y_pred = (y_prob >= threshold).astype(int)
+        y_pred = model.predict(X_test)
+
+        ic, _ = spearmanr(y_test, y_pred)
 
         metrics = {
-            "log_loss":           round(float(log_loss(y_test, y_prob)),                         6),
-            "roc_auc":            round(float(roc_auc_score(y_test, y_prob)),                    6),
-            "accuracy":           round(float(accuracy_score(y_test, y_pred)),                   6),
-            "precision":          round(float(precision_score(y_test, y_pred, zero_division=0)), 6),
-            "recall":             round(float(recall_score(y_test, y_pred, zero_division=0)),    6),
-            "f1":                 round(float(f1_score(y_test, y_pred, zero_division=0)),        6),
-            "n_test":             int(len(y_test)),
-            "positive_rate_true": round(float(y_test.mean()), 4),
-            "positive_rate_pred": round(float(y_pred.mean()), 4),
+            "rmse":   round(float(np.sqrt(mean_squared_error(y_test, y_pred))), 6),
+            "mae":    round(float(mean_absolute_error(y_test, y_pred)),         6),
+            "r2":     round(float(r2_score(y_test, y_pred)),                   6),
+            "ic":     round(float(ic),                                        6),
+            "n_test": int(len(y_test)),
         }
 
         pred_df = test_df[["證券代碼", "年月日", "return"]].copy().reset_index(drop=True)
         pred_df["y_true"] = y_test.values
-        pred_df["y_prob"] = y_prob
         pred_df["y_pred"] = y_pred
 
         imp_df = build_imp_df(model, feature_cols)
@@ -455,8 +458,7 @@ class WalkForwardTrainer:
         print(f"\n{'='*60}")
         print(f"  Walk-Forward 完成  →  {out_path}")
         print(f"{'='*60}")
-        cols = ["window", "test_year", "n_test", "roc_auc", "f1",
-                "threshold", "positive_rate_true", "positive_rate_pred",
-                "hyperparams_tuned"]
+        cols = ["window", "test_year", "n_test", "ic", "rmse", "mae", "r2",
+                "oof_ic", "hyperparams_tuned"]
         show = [c for c in cols if c in summary_df.columns]
         print(summary_df[show].to_string(index=False))

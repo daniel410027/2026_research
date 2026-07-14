@@ -8,7 +8,7 @@ Walk-Forward 回測模組。
 ─────────────────────────────────────────────
   [輸入 Input]
     database/experiment/YYYY_YYYY/predictions.csv
-        欄位：證券代碼, 年月日, return, y_true, y_prob, y_pred
+        欄位：證券代碼, 年月日, return, y_true, y_pred（regression 連續預測值）
         return = 明日開盤 → 後日開盤（已排除 look-ahead bias）
 
     database/experiment/liquidity_filter_meta.json（選用）
@@ -26,8 +26,8 @@ Walk-Forward 回測模組。
   [處理 Process]
     1. 讀取所有 window 的 predictions.csv 並合併
     2. 去除重複（同股票同日期保留最早 window）
-    3. 每個交易日依 y_prob 排序，分成 10 個 Decile 組
-       Decile 1 = y_prob 最高（最看漲）
+    3. 每個交易日依 y_pred 排序，分成 10 個 Decile 組
+       Decile 1 = y_pred 最高（最看漲）
     4. 計算各組每日等權報酬，乘以資金使用率（CAPITAL_USAGE）
     5. 載入 market_return_fwd，對齊日期
     6. 計算 excess_return = D1_scaled - market_return_fwd
@@ -130,9 +130,14 @@ def setup_cjk_font(verbose: bool = True) -> str | None:
 #  設定
 # ============================================================
 
-EXPERIMENT_DIR    = Path("database/experiment")
-DATABASE_MAKE_DIR = Path("database_make")
-OUTPUT_DIR        = Path("output/backtest")
+# ── 路徑（錨定到本腳本所在目錄，與執行時 cwd 無關）──────────
+# 避免從 VS Code / 其他目錄執行時，相對路徑指到錯誤位置
+# （找不到 database/experiment，或 output/ 被建到別處）。
+_ROOT = Path(__file__).resolve().parent
+
+EXPERIMENT_DIR    = _ROOT / "database" / "experiment"
+DATABASE_MAKE_DIR = _ROOT / "database_make"
+OUTPUT_DIR        = _ROOT / "output" / "backtest"
 N_DECILES         = 10
 COST_BPS          = 0       # 單邊交易成本（bps），每日換倉 × 2
 ANNUAL_DAYS       = 252
@@ -231,12 +236,12 @@ def load_market_return(db_make_dir: Path) -> pd.Series:
 
 
 def assign_deciles(df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
-    """每個交易日依 y_prob 降序分 n 組，Decile 1 = 最高 prob。
+    """每個交易日依 y_pred 降序分 n 組，Decile 1 = 最高預測值。
     Vectorized 實作，避免 pandas 2.x groupby.apply 的 index 問題。
     """
     df = df.copy().reset_index(drop=True)
-    df["_rank"] = df.groupby(DATE_COL)["y_prob"].rank(method="first", ascending=False)
-    df["_size"] = df.groupby(DATE_COL)["y_prob"].transform("count")
+    df["_rank"] = df.groupby(DATE_COL)["y_pred"].rank(method="first", ascending=False)
+    df["_size"] = df.groupby(DATE_COL)["y_pred"].transform("count")
     mask = df["_size"] >= n
     df["decile"] = np.nan
     df.loc[mask, "decile"] = np.ceil(
