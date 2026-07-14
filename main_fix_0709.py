@@ -164,6 +164,7 @@ class RunConfig:
         "market_return_fwd",   # ★ 前視 T+1→T+2：2026-06-25 起保留於 database_make/ 輸出
                                 #   （供 backtest.py 對齊大盤用),訓練端仍須排除,防 look-ahead
         "market_index",        # 與 model._EXCLUDE_COLS 既有項目對齊（idempotent）
+        "market_return"
     }
 
     # ── ★ 流動性篩選（805_group2 formula3_amount_mv_turnover）────

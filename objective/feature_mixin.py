@@ -386,13 +386,8 @@ class FeatureMixin:
 
         # 本週以來報酬率（WTD）
         def _wtd(group):
-            dt    = group["年月日"]
-            yw    = dt.dt.isocalendar().year * 100 + dt.dt.isocalendar().week
-            yw    = yw.values
-            first = pd.Series(yw).map(
-                dict(zip(*np.unique(yw, return_index=True)))
-            )  # index of first occurrence per week
-            # 使用 groupby week
+            # ★ 2026-07-13 清理：移除未使用的 isocalendar first-occurrence
+            #   dead code（yw/first 計算後從未被引用）。邏輯不變。
             week_key = pd.to_datetime(group["年月日"]).dt.to_period("W")
             first_c  = group.groupby(week_key)[c].transform("first")
             return group[c] / (first_c + 1e-9) - 1
@@ -561,8 +556,9 @@ class FeatureMixin:
                 .fillna(0)
             )
             # 本週以來
+            # ★ 2026-07-13 清理：移除 dead 欄位 dealer_net_wtd
+            #   （純複製 dealer_net、下游從未引用，KEEP_FEATURES 白名單亦會丟棄）。
             week_key = df["年月日"].dt.to_period("W")
-            df["dealer_net_wtd"] = df["dealer_net"].copy()
             df["自營本週以來買賣超千股"] = (
                 df.groupby(["證券代碼", week_key])["dealer_net"]
                 .transform("cumsum") / 1000
@@ -1102,9 +1098,18 @@ class FeatureMixin:
             # 個股：當列收盤 / 當週第一日收盤 - 1（到當日為止的 WTD）
             first_c   = group.groupby(wk)[_CLOSE].transform("first")
             stock_wtd = group[_CLOSE] / (first_c + 1e-9) - 1
-            # 大盤：週內 expanding 累乘（cumprod），同樣只到當日
+            # 大盤：週內 expanding 累乘（cumprod），同樣只到當日。
+            # ★ 2026-07-13 leg-alignment 修正：
+            #   個股腳以「週首日收盤」為基準 → 不含週首日自身的報酬；
+            #   舊版大盤腳 cumprod 從週首日開始累乘 → 多含一天
+            #   （上週末收 → 週首日收），兩腳窗口差一天，
+            #   特徵被注入 −market_return[週首日] 的系統性偏移
+            #   （週首日當天：個股腳=0、大盤腳=當日大盤報酬 → 特徵=純大盤噪音）。
+            #   修法：cumprod 除掉週首日的 (1+r)，使大盤腳同樣以
+            #   「週首日收盤」為基準（週首收 → 當日收），與個股腳完全同窗。
+            #   修正後週首日兩腳皆為 0。
             mkt_wtd   = group.groupby(wk)["market_return"].transform(
-                lambda x: (1 + x).cumprod() - 1
+                lambda x: (1 + x).cumprod() / (1 + x.iloc[0]) - 1
             )
             return (stock_wtd - mkt_wtd).fillna(0)
 

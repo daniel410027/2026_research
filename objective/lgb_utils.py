@@ -156,7 +156,13 @@ def tune_lgb(
     sample_weight:     np.ndarray | None = None,
     dates:             pd.Series | np.ndarray | None = None,
     return_best_iters: bool = False,
-) -> tuple[dict, np.ndarray] | tuple[dict, np.ndarray, list[int]]:
+    return_cv_details: bool = False,
+) -> (
+    tuple[dict, np.ndarray]
+    | tuple[dict, np.ndarray, list[int]]
+    | tuple[dict, np.ndarray, list[float]]
+    | tuple[dict, np.ndarray, list[int], list[float]]
+):
     """
     Optuna TPE 調參 + 最佳參數 OOF prob 收集（date-aware CV）。
 
@@ -179,18 +185,30 @@ def tune_lgb(
     dates             : 可選，與 X_train 逐列對齊的日期序列；
                         提供時以唯一交易日為單位切折（建議）
     return_best_iters : True 時回傳 3-tuple（含每折 best_iteration）
+    return_cv_details : True 時額外回傳最佳 trial 的逐折 CV logloss
+                        （來自 Optuna best_trial 的 objective 內部評估，
+                        不重新訓練，不增加額外耗時）
 
     Returns
     -------
     best_params : dict         ── Optuna 最佳超參數（不含 base params）
     oof_prob    : np.ndarray   ── OOF 預測機率（未被任何 valid fold 命中者為 NaN）
     best_iters  : list[int]    ── 僅 return_best_iters=True 時
+    best_fold_losses : list[float] ── 僅 return_cv_details=True 時，
+                        最佳超參數組合在 Optuna 搜尋當下、各折的 binary_logloss
+                        （與 objective() 內計算方式一致，用於 cv_metrics.json）
     """
     cv_folds = _make_cv_folds(X_train, n_splits, dates)
 
     # ── Optuna ──────────────────────────────────────────────
     def objective(trial: optuna.Trial) -> float:
-        params = {**_LGB_BASE_PARAMS, **_suggest_params(trial)}
+        # ★ seed 固定 LightGBM 內部所有隨機來源（bagging/feature_fraction/
+        #   data 等），確保同一組 trial 超參數在重跑時得到相同結果。
+        params = {
+            **_LGB_BASE_PARAMS,
+            **_suggest_params(trial),
+            "seed": random_state,
+        }
         fold_losses = []
         for tr_idx, va_idx in cv_folds:
             w_tr = sample_weight[tr_idx] if sample_weight is not None else None
@@ -213,6 +231,9 @@ def tune_lgb(
                 1e-7, 1 - 1e-7,
             )
             fold_losses.append(log_loss(y_train.iloc[va_idx], prob))
+        # ★ 存進 trial user_attrs，供搜尋結束後從 study.best_trial 撈出，
+        #   不需重新訓練即可取得最佳超參數當下的逐折 CV logloss。
+        trial.set_user_attr("fold_losses", fold_losses)
         return float(np.mean(fold_losses))
 
     study = optuna.create_study(
@@ -221,6 +242,7 @@ def tune_lgb(
     )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     best_params = study.best_params
+    best_fold_losses = list(study.best_trial.user_attrs.get("fold_losses", []))
     print(f"  Best CV log-loss: {study.best_value:.6f}")
 
     # ── 最佳參數 OOF prob ────────────────────────────────────
@@ -229,13 +251,19 @@ def tune_lgb(
         oof_prob, best_iters = collect_oof_prob(
             X_train, y_train, best_params, n_splits, sample_weight, dates,
             num_boost_round=1000, early_stopping_rounds=50, return_best_iters=True,
+            random_state=random_state,
         )
+        if return_cv_details:
+            return best_params, oof_prob, best_iters, best_fold_losses
         return best_params, oof_prob, best_iters
 
     oof_prob = collect_oof_prob(
-        X_train, y_train, best_params, n_splits, sample_weight, dates
+        X_train, y_train, best_params, n_splits, sample_weight, dates,
+        random_state=random_state,
     )
 
+    if return_cv_details:
+        return best_params, oof_prob, best_fold_losses
     return best_params, oof_prob
 
 
@@ -249,6 +277,7 @@ def collect_oof_prob(
     num_boost_round:       int = 500,
     early_stopping_rounds: int | None = None,
     return_best_iters:     bool = False,
+    random_state:          int | None = None,
 ) -> np.ndarray | tuple[np.ndarray, list[int]]:
     """
     固定超參數下，只跑 date-aware CV 收集 OOF prob。
@@ -274,6 +303,8 @@ def collect_oof_prob(
     num_boost_round       : 每折最大輪數（預設 500；搭配 ES 時建議 1000）
     early_stopping_rounds : 提供時啟用 early stopping
     return_best_iters     : True 時回傳 (oof_prob, best_iters)
+    random_state          : 提供時固定 LightGBM 內部隨機種子（seed），
+                             確保同一組 best_params 重跑時 OOF 結果一致
 
     Returns
     -------
@@ -285,6 +316,8 @@ def collect_oof_prob(
     """
     cv_folds   = _make_cv_folds(X_train, n_splits, dates)
     params     = {**_LGB_BASE_PARAMS, **best_params}
+    if random_state is not None:
+        params["seed"] = random_state
     oof_prob   = np.full(len(y_train), np.nan)   # NaN 初始化（非 0）
     best_iters = []
 
@@ -326,6 +359,7 @@ def train_final_lgb(
     best_params:     dict,
     sample_weight:   np.ndarray | None = None,
     num_boost_round: int               = 500,
+    random_state:    int | None        = None,
 ) -> lgb.Booster:
     """
     最終模型訓練（全量 X_train，不做 early stopping）。
@@ -335,12 +369,16 @@ def train_final_lgb(
     best_params     : tune_lgb 回傳的超參數 dict（不含 base params）
     sample_weight   : 可選 shape=(n_train,)
     num_boost_round : 訓練輪數（預設 500）
+    random_state    : 提供時固定 LightGBM 內部隨機種子（seed），
+                       確保相同資料 + 相同超參數重跑時模型完全一致
 
     Returns
     -------
     lgb.Booster
     """
     params = {**_LGB_BASE_PARAMS, **best_params}
+    if random_state is not None:
+        params["seed"] = random_state
     return lgb.train(
         params,
         lgb.Dataset(X_train, label=y_train, weight=sample_weight),
