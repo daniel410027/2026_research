@@ -4,3 +4,4 @@ output
 *test.py
 
 database*
+__pycache__/
