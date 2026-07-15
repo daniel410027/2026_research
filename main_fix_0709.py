@@ -89,9 +89,6 @@ import time
 import types
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -144,7 +141,6 @@ class RunConfig:
     ML_WINDOW_END   = 2025
 
     # ── 執行步驟 ─────────────────────────────────────────────
-    RUN_DIAGNOSTICS = False
     RUN_ML          = True
 
     # ── ★ 超參數模式 ─────────────────────────────────────────
@@ -199,74 +195,6 @@ class RunConfig:
     # 篩選後資料快取目錄（依參數 tag 命名，非時間戳；同 tag 已存在則重用，
     # 避免每次重跑都重算，也避免殘留舊目錄造成混淆——805_group2 bug #5 教訓）
     LIQ_FILTERED_ROOT = Path("database_make_liq_filtered")
-
-
-# ============================================================
-#  診斷工具
-# ============================================================
-
-ID_COLS    = {"證券代碼", "年月日"}
-LABEL_COLS = {"return", "return_tick", "return_tick_0",
-              "excess_return", "excess_return_tick"}
-
-
-def save_distribution_plots(df: pd.DataFrame, output_dir: Path):
-    PLOT_COLS = {
-        "return":             "continuous",
-        "excess_return":      "continuous",
-        "return_tick":        "discrete",
-        "excess_return_tick": "discrete",
-    }
-    for col, kind in PLOT_COLS.items():
-        if col not in df.columns:
-            print(f"  ⚠ 欄位 '{col}' 不存在，跳過")
-            continue
-
-        series = df[col].dropna()
-        fig, ax = plt.subplots(figsize=(8, 4))
-
-        if kind == "continuous":
-            ax.hist(series, bins=100, color="#2c7bb6", edgecolor="none", alpha=0.85)
-            ax.axvline(series.mean(),   color="#d7191c", linewidth=1.2,
-                       label=f"mean={series.mean():.4f}")
-            ax.axvline(series.median(), color="#fdae61", linewidth=1.2, linestyle="--",
-                       label=f"median={series.median():.4f}")
-            ax.legend(fontsize=9)
-        else:
-            counts = series.value_counts().sort_index()
-            labels = [str(int(v)) for v in counts.index]
-            colors = ["#d7191c" if v == 1 else "#2c7bb6" for v in counts.index]
-            bars   = ax.bar(labels, counts.values, color=colors, edgecolor="none", alpha=0.85)
-            total  = counts.sum()
-            for bar, val in zip(bars, counts.values):
-                ax.text(
-                    bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + total * 0.005,
-                    f"{val:,}\n({val/total:.1%})",
-                    ha="center", va="bottom", fontsize=9,
-                )
-
-        ax.set_xlabel(col)
-        ax.set_ylabel("Count")
-        ax.set_title(f"Distribution of {col}  (n={len(series):,})", fontsize=11)
-        ax.spines[["top", "right"]].set_visible(False)
-        plt.tight_layout()
-
-        out_path = output_dir / f"{col}_dist.png"
-        fig.savefig(out_path, dpi=150)
-        plt.close(fig)
-        print(f"  ✓ {out_path}")
-
-
-def save_label_csv(df: pd.DataFrame, output_dir: Path):
-    cols    = ["證券代碼", "年月日", "return", "excess_return", "beta"]
-    missing = [c for c in cols if c not in df.columns]
-    if missing:
-        print(f"  ⚠ 缺少欄位 {missing}，labels.csv 跳過")
-        return
-    out_path = output_dir / "labels.csv"
-    df[cols].to_csv(out_path, index=False)
-    print(f"  ✓ {out_path}  ({len(df):,} 筆)")
 
 
 # ============================================================
@@ -491,17 +419,6 @@ def align_features_with_live(cfg: RunConfig):
 # ============================================================
 
 def run_ml(cfg: RunConfig):
-    output_dir = Path("output") / f"{cfg.ML_WINDOW_START}_{cfg.ML_WINDOW_END}"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    if cfg.RUN_DIAGNOSTICS:
-        print("\n► 讀取預計算特徵（診斷用）…")
-        df = load_precomputed(cfg)
-        print("\n► 診斷圖表")
-        save_distribution_plots(df, output_dir)
-        save_label_csv(df, output_dir)
-        del df
-
     # ── ★ 超參數決策 ─────────────────────────────────────────
     if cfg.TUNE_FIRST_FOLD:
         print("\n► 超參數模式：第一個 fold Optuna tune"
@@ -570,7 +487,6 @@ def main():
         print(f"  Optuna    : 第一個 fold tune（{cfg.N_TRIALS} trials）→ 之後凍結")
     else:
         print(f"  Optuna    : 停用（固定超參數）")
-    print(f"  Diagnostics: {cfg.RUN_DIAGNOSTICS}")
     print(f"  對齊 live  : {cfg.ALIGN_FEATURES_WITH_LIVE}")
     if cfg.LIQ_FILTER_ENABLED:
         print(f"  流動性篩選: 開啟（formula3  w1={cfg.LIQ_W1}  w2={cfg.LIQ_W2}  "
