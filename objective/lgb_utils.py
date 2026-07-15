@@ -1,7 +1,7 @@
 """
 lgb_utils.py
 ============
-LightGBM 共用工具函式。
+LightGBM 共用工具函式（regression 版）。
 
 WalkForwardTrainer（model.py）與 DailyTrainer（daily_model.py）
 原本各自重複實作 _tune / _train_final / _find_threshold / _build_imp_df，
@@ -14,8 +14,8 @@ WalkForwardTrainer（model.py）與 DailyTrainer（daily_model.py）
       兩端呼叫時按需傳入即可，行為完全一致。
 
     [2025 更新] 新增 collect_oof_prob：
-    - 超參數凍結模式下，跳過 Optuna，只用固定參數跑 CV 收集 OOF prob
-    - 供 evaluate_oof_ic 監控使用，耗時約為 tune_lgb 的 1/n_trials
+    - 超參數凍結模式下，跳過 Optuna，只用固定參數跑 CV 收集 OOF 預測值
+    - 供 evaluate_oof_ic 使用，耗時約為 tune_lgb 的 1/n_trials
 
     [2026 修正] CV 切折以「唯一交易日」為單位（date-aware）：
     - 問題①：上游 train_df 若為 stock-major 排序，row-based TimeSeriesSplit
@@ -31,9 +31,19 @@ WalkForwardTrainer（model.py）與 DailyTrainer（daily_model.py）
     向後相容：dates 為 None 時退回傳統 row-based TimeSeriesSplit
               （DailyTrainer 若未傳 dates，行為與舊版一致）。
 
+    [2026-07-14 regression 改版] target 由 binary（excess_return_tick）
+    改為連續值（excess_return）：
+    - _LGB_BASE_PARAMS: objective binary→regression, metric binary_logloss→rmse
+    - Optuna objective() 的 CV loss 由 log_loss 改為 RMSE
+    - find_threshold（OOF F1 最佳機率門檻）→ evaluate_oof_ic（Spearman IC 監控，
+      不做 threshold；regression target 沒有天然的 0/1 切點，選股門檻改由
+      呼叫端用預測值排序 / decile 決定）
+    - oof_prob 變數名沿用（僅為 CV 折內部命名慣例），實際內容已是連續預測值，
+      非機率
+
 公開函式：
-    tune_lgb          Optuna TPE 調參 + OOF prob 收集
-    collect_oof_prob  固定超參數下只收集 OOF prob（凍結模式用）
+    tune_lgb          Optuna TPE 調參 + OOF 預測值收集
+    collect_oof_prob  固定超參數下只收集 OOF 預測值（凍結模式用）
     train_final_lgb   最終模型訓練（全量 X_train）
     evaluate_oof_ic   OOF Spearman IC 監控（自動略過 NaN，不做 threshold）
     build_imp_df      特徵重要性 DataFrame（gain）
@@ -185,14 +195,14 @@ def tune_lgb(
     dates             : 可選，與 X_train 逐列對齊的日期序列；
                         提供時以唯一交易日為單位切折（建議）
     return_best_iters : True 時回傳 3-tuple（含每折 best_iteration）
-    return_cv_details : True 時額外回傳最佳 trial 的逐折 CV logloss
+    return_cv_details : True 時額外回傳最佳 trial 的逐折 CV RMSE
                         （來自 Optuna best_trial 的 objective 內部評估，
                         不重新訓練，不增加額外耗時）
 
     Returns
     -------
     best_params : dict         ── Optuna 最佳超參數（不含 base params）
-    oof_prob    : np.ndarray   ── OOF 預測機率（未被任何 valid fold 命中者為 NaN）
+    oof_prob    : np.ndarray   ── OOF 連續預測值（未被任何 valid fold 命中者為 NaN）
     best_iters  : list[int]    ── 僅 return_best_iters=True 時
     best_fold_losses : list[float] ── 僅 return_cv_details=True 時，
                         最佳超參數組合在 Optuna 搜尋當下、各折的 RMSE
@@ -227,11 +237,10 @@ def tune_lgb(
                 callbacks=[lgb.early_stopping(50, verbose=False)],
             )
             pred = m.predict(X_train.iloc[va_idx], num_iteration=m.best_iteration)
-            fold_losses.append(
-                float(np.sqrt(np.mean((y_train.iloc[va_idx].to_numpy() - pred) ** 2)))
-            )
+            rmse = float(np.sqrt(np.mean((y_train.iloc[va_idx].to_numpy() - pred) ** 2)))
+            fold_losses.append(rmse)
         # ★ 存進 trial user_attrs，供搜尋結束後從 study.best_trial 撈出，
-        #   不需重新訓練即可取得最佳超參數當下的逐折 CV logloss。
+        #   不需重新訓練即可取得最佳超參數當下的逐折 CV RMSE。
         trial.set_user_attr("fold_losses", fold_losses)
         return float(np.mean(fold_losses))
 
@@ -307,7 +316,7 @@ def collect_oof_prob(
 
     Returns
     -------
-    oof_prob : np.ndarray  ── 與 y_train 等長；
+    oof_prob : np.ndarray  ── 與 y_train 等長（實際為連續預測值）；
                最早一段（從不在任何 valid fold）保持 NaN，
                由 evaluate_oof_ic 自動略過，避免污染 IC 計算。
     best_iters : list[int]（僅 return_best_iters=True 時）

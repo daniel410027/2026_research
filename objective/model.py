@@ -78,31 +78,32 @@ _NEW_FEATURES = ["beta", "vol20", "daily_return",
                  "CAPM_Beta一月", "CAPM_Beta九月", "CAPM_Beta一年"]
 
 _EXCLUDE_COLS = {
-    "證券代碼", "年月日", "market_index",
+    "證券代碼", "年月日",
     "return", "return_tick", "return_tick_0",
     "excess_return", "excess_return_tick",
-    # [2026-07-14] market_return：backward 大盤日報酬（T-1→T 收盤），時序上無
-    #   look-ahead，但為 per-day constant——同日所有股票值相同，等同「日期指紋」。
-    #   Pooled panel 訓練下樹模型可據此辨識特定日期、記憶該日平均 excess return
-    #   （兩年 train 僅 ~490 個唯一交易日，date-level conditioning 極易過擬合）；
-    #   對每日 cross-sectional decile 排序無直接資訊。有用的交互版本
-    #   （超額報酬日大盤/週大盤、beta）已在特徵集，原始值屬冗餘。
-    #   欄位仍保留於 database_make/ CSV（make 階段的 beta/超額報酬計算依賴它）。
-    "market_return",
-    # [2026-06 對齊 live] 以下兩欄納入 base，使 WF 與 daily_model.py 共用同一訓練特徵集。
-    #   排除邏輯自此集中於本模組，不再依賴各進入點（main.py / main_fix.py）以
-    #   EXTRA_EXCLUDE_COLS 擴充；其既有 union 變為 idempotent 冗餘，可保留不動。
-    #   注意：目前 database_make/ 並無這兩欄，故此改動不會改變現有特徵集，
-    #         純為防止未來 schema 新增時的靜默 train/serve 漂移。
-    "amount",            # 成交金額：僅作流動性過濾，不進訓練
-    "market_return_fwd", # 前視 T+1：label 建構用，防呆排除
-    # [2026-07-08] 市場別：make_new.py 自 market_type.csv merge 進來的靜態字串欄
-    #   （sii/otc/rotc），供 live 端 universe 過濾與檢視用。目前因 object dtype
-    #   會被 _resolve_features 的 is_numeric_dtype 靜默濾掉，但該防線依賴 dtype
-    #   巧合——若未來被 encode 成數值即無聲進入特徵集。顯式排除以固定意圖。
-    #   （panel 已經 sii 篩選，此欄近乎常數，本無訓練價值。）
-    "市場別",
+    "market_return_fwd",
+    "amount", "close",
+    "market_value",
 }
+# [2026-07-15] 與 daily_model_0714_fix.py 的 _EXCLUDE_COLS 統一為同一組，
+# 確保 walk-forward 回測與線上 DailyTrainer 用完全相同的訓練特徵集,結果才能互相比較。
+#
+# 與舊版本檔的差異（決策記錄，供日後回頭檢視）：
+#   - market_return：舊版本檔排除（理由：per-day constant,兩年 train 僅 ~490 個唯一
+#     交易日,樹模型可能靠它記住特定日期的平均 excess return,構成 date-level
+#     overfitting 風險）。daily_model_0714_fix.py 現行判斷是「應該沒有資料洩漏問題」
+#     而不排除。這裡選擇跟 daily_model 一致,但上述過擬合疑慮本身並未被推翻——
+#     如果之後 walk-forward 的 IC／RMSE 明顯優於「排除 market_return」時的舊結果、
+#     或 feature_importance 顯示 market_return 排名異常前面,要回頭檢查是不是在吃
+#     日期指紋而非真實訊號。
+#   - close / market_value：舊版本檔沒排除（等同讓 WalkForwardTrainer 拿這兩欄
+#     當特徵）。daily_model_0714_fix.py 與 feature_mixin.py 的既有設計是把它們當
+#     「保留於 CSV、不進訓練」的 conditioning / benchmark 欄位,這裡改為與其一致排除。
+#   - market_index / 市場別：兩者在 database_make/ 目前分別是「不存在」與「非數值
+#     字串欄」,原本的排除本來就是 no-op,拿掉不影響行為。
+#
+# 注意：database/experiment/*/ 內既有的 walk-forward 結果是用舊特徵集跑出來的,
+# 跟本次改動後重跑的結果不可直接比較,需要的話重新跑一次 windows 取得新基準。
 
 
 def load_feature_list() -> list[str]:
