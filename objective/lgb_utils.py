@@ -53,6 +53,7 @@ WalkForwardTrainer（model.py）與 DailyTrainer（daily_model.py）
 
 from __future__ import annotations
 
+import os
 import warnings
 
 import lightgbm as lgb
@@ -70,11 +71,15 @@ warnings.filterwarnings("ignore")
 #  LightGBM 超參數搜尋空間（集中定義，避免兩端各自維護）
 # ============================================================
 
+# ★ n-2 核平行運算：保留 2 核給系統/其他行程，避免搶占整台機器
+_N_JOBS = max(1, (os.cpu_count() or 1) - 2)
+
 _LGB_BASE_PARAMS = {
     "objective":     "regression",
     "metric":        "rmse",
     "verbosity":     -1,
     "boosting_type": "gbdt",
+    "num_threads":   _N_JOBS,
 }
 
 _SEARCH_SPACE = {

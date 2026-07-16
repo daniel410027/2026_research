@@ -448,7 +448,7 @@ def run_ml(cfg: RunConfig):
         target_col         = cfg.LABEL,
         n_trials           = cfg.N_TRIALS,
         use_vol_weight     = False,
-        freeze_hyperparams = True,   # 第一個 fold 之後凍結（或配合預植全程凍結）
+        freeze_hyperparams = False,   # 第一個 fold 之後凍結（或配合預植全程凍結）
         retune_every_n     = 999,    # 完全凍結，永不 re-tune
     )
     trainer = WalkForwardTrainer(ml_config)
