@@ -156,6 +156,12 @@ class WalkForwardConfig:
     vol_weight_col:  str   = "vol20"
     vol_weight_clip: float = 0.05
 
+    # ── Return-Magnitude Sample Weighting（rank-based，可獨立開關）──
+    # 報酬（target_col）越高，訓練時權重越大；與 vol weight 同樣採 rank-based
+    # 而非用 raw 數值，避免極端報酬把 RMSE 已有的離群值敏感度再放大一次。
+    # 若 use_vol_weight 也開啟，兩者 rank weight 相乘後再正規化。
+    use_return_weight: bool = False
+
     # ── 輸出路徑 ──────────────────────────────────────────────
     output_dir: Path = field(default_factory=lambda: Path("database/experiment"))
 
@@ -364,8 +370,9 @@ class WalkForwardTrainer:
             "train_years":        str(train_years),
             "test_year":          test_year,
             "oof_ic":             oof_ic,
-            "vol_weight_used":    train_weight is not None,
-            "vol_weight_col":     self.cfg.vol_weight_col if train_weight is not None else None,
+            "vol_weight_used":    self.cfg.use_vol_weight,
+            "vol_weight_col":     self.cfg.vol_weight_col if self.cfg.use_vol_weight else None,
+            "return_weight_used": self.cfg.use_return_weight,
             "hyperparams_tuned":  do_tune,   # 本 fold 是否重新 tune
         })
 
@@ -389,7 +396,7 @@ class WalkForwardTrainer:
             print(f"  ⚠ 候選特徵中有 {len(missing)} 個不存在於 df，已略過")
         return feature_cols
 
-    def _compute_sample_weights(self, train_df: pd.DataFrame) -> np.ndarray | None:
+    def _compute_vol_weights(self, train_df: pd.DataFrame) -> np.ndarray | None:
         if not self.cfg.use_vol_weight:
             return None
         col = self.cfg.vol_weight_col
@@ -404,6 +411,49 @@ class WalkForwardTrainer:
         print(
             f"  Vol weight (rank-based) [{col}]: "
             f"min={w.min():.3f}  max={w.max():.3f}  std={w.std():.3f}  n={n:,}"
+        )
+        return w
+
+    def _compute_return_weights(self, train_df: pd.DataFrame) -> np.ndarray | None:
+        """
+        報酬（target_col）越高，訓練權重越大。rank-based（而非 raw 數值）：
+        避免單筆極端報酬把 RMSE 已有的離群值敏感度再放大一次，也不會出現
+        「只認正報酬」的斷點——負報酬只是權重較低，仍有梯度貢獻。
+        """
+        if not self.cfg.use_return_weight:
+            return None
+        col = self.cfg.target_col
+        if col not in train_df.columns:
+            print(f"  ⚠ target_col='{col}' 不存在，改用等權訓練")
+            return None
+        r     = train_df[col].values.astype(float)
+        n     = len(r)
+        ranks = pd.Series(r).rank(method="average", ascending=True).values
+        w     = ranks / n
+        w     = w / w.mean()
+        print(
+            f"  Return weight (rank-based) [{col}]: "
+            f"min={w.min():.3f}  max={w.max():.3f}  std={w.std():.3f}  n={n:,}"
+        )
+        return w
+
+    def _compute_sample_weights(self, train_df: pd.DataFrame) -> np.ndarray | None:
+        """合併 vol weight 與 return weight（各自可獨立開關），相乘後正規化。"""
+        w_vol    = self._compute_vol_weights(train_df)
+        w_return = self._compute_return_weights(train_df)
+
+        if w_vol is None and w_return is None:
+            return None
+        if w_vol is None:
+            return w_return
+        if w_return is None:
+            return w_vol
+
+        w = w_vol * w_return
+        w = w / w.mean()
+        print(
+            f"  Combined weight (vol × return): "
+            f"min={w.min():.3f}  max={w.max():.3f}  std={w.std():.3f}"
         )
         return w
 

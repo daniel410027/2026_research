@@ -200,6 +200,10 @@ class RunConfig:
     # 避免每次重跑都重算，也避免殘留舊目錄造成混淆——805_group2 bug #5 教訓）
     LIQ_FILTERED_ROOT = Path("database_make_liq_filtered")
 
+    # ── ★ Return-Magnitude Sample Weighting（rank-based，預設關閉）────
+    # 開啟後訓練時報酬（LABEL）越高權重越大；若同時開 vol weight 則相乘正規化。
+    USE_RETURN_WEIGHT: bool = False
+
 
 # ============================================================
 #  資料載入
@@ -473,6 +477,7 @@ def run_ml(cfg: RunConfig):
         target_col         = cfg.LABEL,
         n_trials           = cfg.N_TRIALS,
         use_vol_weight     = False,
+        use_return_weight  = cfg.USE_RETURN_WEIGHT,
         freeze_hyperparams = False,   # 第一個 fold 之後凍結（或配合預植全程凍結）
         retune_every_n     = 999,    # 完全凍結，永不 re-tune
     )
