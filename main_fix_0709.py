@@ -179,6 +179,10 @@ class RunConfig:
                                 #   對 cross-sectional 排序無資訊且易致 date-level 過擬合；
                                 #   保留於 CSV 供 make 階段與檢視用（與 model._EXCLUDE_COLS 雙重防護）
         "market_index",        # 與 model._EXCLUDE_COLS 既有項目對齊（idempotent）
+        "clu_id_local",        # ★ 606_corr 群組編號：跨期 label switching 無對應意義，不當訓練
+                                #   特徵；若 database_make/ 之後從 2026_daily 移植含此欄的資料，
+                                #   保留於 CSV 供下游集中風險控管（同一輪選股避免同一群組壓過多
+                                #   倉位）用，訓練端仍排除（與 904_group/main_fix_0709.py 一致）
     }
 
     # ── ★ 流動性篩選（805_group2 formula3_amount_mv_turnover）────
@@ -299,6 +303,22 @@ def liq_tag(w1: float, w2: float, keep_ratio: float) -> str:
     return f"f3_w1{_fmt(w1)}_w2{_fmt(w2)}_kr{_fmt(keep_ratio)}"
 
 
+def _liq_cache_stale_reason(cfg: "RunConfig", out_dir: Path, years: list[int]) -> str | None:
+    """
+    比對 database_make/ 來源檔與快取檔的修改時間。
+    若任一年份的來源檔比快取檔新（例如重跑過 make_new.py），
+    代表快取內容已經過期、不能再重用 → 回傳過期原因字串；否則回傳 None。
+    """
+    for year in years:
+        src = cfg.PRECOMPUTED_DIR / f"{year}.csv"
+        cached = out_dir / f"{year}.csv"
+        if not src.exists() or not cached.exists():
+            continue
+        if src.stat().st_mtime > cached.stat().st_mtime:
+            return f"{src} 比快取檔 {cached} 新"
+    return None
+
+
 def build_liquidity_filtered_dir(cfg: "RunConfig") -> Path:
     """
     對 [ML_WINDOW_START, ML_WINDOW_END] 全範圍資料套用流動性篩選
@@ -306,8 +326,10 @@ def build_liquidity_filtered_dir(cfg: "RunConfig") -> Path:
     輸出成同樣的 per-year CSV 結構到 LIQ_FILTERED_ROOT/{tag}/，
     供 WalkForwardTrainer 直接當作 precomputed_dir 讀取。
 
-    快取：若目錄已存在且涵蓋所需年份 → 直接重用，不重算
-    （與 test.py/optimize_turnover_filter.py 的 SQLite 續跑精神一致）。
+    快取：若目錄已存在、涵蓋所需年份、且來源檔（database_make/）未被
+    更新過 → 直接重用，不重算（與 test.py/optimize_turnover_filter.py
+    的 SQLite 續跑精神一致）。若來源檔的修改時間比快取檔新（例如重跑過
+    make_new.py 產生新特徵），則視為過期並自動重算，避免訓練用到舊資料。
     """
     tag     = liq_tag(cfg.LIQ_W1, cfg.LIQ_W2, cfg.LIQ_KEEP_RATIO)
     out_dir = cfg.LIQ_FILTERED_ROOT / tag
@@ -315,10 +337,13 @@ def build_liquidity_filtered_dir(cfg: "RunConfig") -> Path:
 
     existing = [out_dir / f"{y}.csv" for y in years if (out_dir / f"{y}.csv").exists()]
     if out_dir.exists() and len(existing) == len(years):
-        print(f"  ✓ 快取命中，重用已篩選資料: {out_dir}/（{len(years)} 年）")
-        return out_dir
-
-    print(f"  快取未命中，重新計算流動性篩選 → {out_dir}/")
+        stale_reason = _liq_cache_stale_reason(cfg, out_dir, years)
+        if stale_reason is None:
+            print(f"  ✓ 快取命中，重用已篩選資料: {out_dir}/（{len(years)} 年）")
+            return out_dir
+        print(f"  ⚠ 快取已過期（{stale_reason}），重新計算流動性篩選 → {out_dir}/")
+    else:
+        print(f"  快取未命中，重新計算流動性篩選 → {out_dir}/")
     print(f"  w1(amount)={cfg.LIQ_W1}  w2(mv)={cfg.LIQ_W2}  "
           f"w3(turnover)={1 - cfg.LIQ_W1 - cfg.LIQ_W2:.4f}  "
           f"keep_ratio={cfg.LIQ_KEEP_RATIO}")
