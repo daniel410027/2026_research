@@ -85,6 +85,16 @@ _EXCLUDE_COLS = {
     "amount", "close",
     "market_value",
 }
+
+# ★ 2026-07-22：前綴排除。606_corr 的群組編號欄名跨期會變（2017–2023 為
+#   clu_id_local、2024 起改名 clu_id_daily），逐一列舉在 _EXCLUDE_COLS 會漏——
+#   實際上 database_make_liq_filtered/ 的 2025.csv 兩個欄名同時存在，而排除清單
+#   只有 clu_id_local，導致 clu_id_daily 以 importance 0.152 / rank 41 進入訓練。
+#   群組編號是任意標籤（label switching），跨期無對應意義，不應作為數值特徵。
+#   改用前綴比對，之後再改名也不會漏。
+_EXCLUDE_PREFIXES = (
+    "clu_id",
+)
 # [2026-07-15] 與 daily_model_0714_fix.py 的 _EXCLUDE_COLS 統一為同一組，
 # 確保 walk-forward 回測與線上 DailyTrainer 用完全相同的訓練特徵集,結果才能互相比較。
 #
@@ -384,7 +394,10 @@ class WalkForwardTrainer:
         return metrics
 
     def _resolve_features(self, df: pd.DataFrame) -> list[str]:
-        available = set(df.columns) - _EXCLUDE_COLS
+        available = {
+            c for c in set(df.columns) - _EXCLUDE_COLS
+            if not c.startswith(_EXCLUDE_PREFIXES)
+        }
         if not self.cfg.use_features_csv:
             return [
                 c for c in df.columns

@@ -183,6 +183,10 @@ class RunConfig:
                                 #   特徵；若 database_make/ 之後從 2026_daily 移植含此欄的資料，
                                 #   保留於 CSV 供下游集中風險控管（同一輪選股避免同一群組壓過多
                                 #   倉位）用，訓練端仍排除（與 904_group/main_fix_0709.py 一致）
+        "clu_id_daily",        # ★ 2026-07-22：同上，2024 年起的新欄名（2017–2023 為
+                                #   clu_id_local）。此處保留顯式列舉僅為可讀性，實際防護是
+                                #   model._EXCLUDE_PREFIXES 的 "clu_id" 前綴比對（雙重防護，
+                                #   之後再改名不必回來改這裡）
     }
 
     # ── ★ 流動性篩選（805_group2 formula3_amount_mv_turnover）────
