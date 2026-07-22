@@ -71,23 +71,43 @@ warnings.filterwarnings("ignore")
 #  LightGBM 超參數搜尋空間（集中定義，避免兩端各自維護）
 # ============================================================
 
-# ★ n-2 核平行運算：保留 2 核給系統/其他行程，避免搶占整台機器
-_N_JOBS = max(1, (os.cpu_count() or 1) - 2)
+# ★ 保留 2 核給系統/其他行程，避免搶占整台機器
+_N_CORES = max(1, (os.cpu_count() or 1) - 2)
 
-# ★ 2026-07-22：平行層級由 LightGBM thread 改為 Optuna trial（見下方 study.optimize
-#   的 n_jobs）。每個 trial 固定單執行緒，OMP 也必須跟著設 1——macOS 上 LightGBM
-#   與 OpenMP 在多行程情境不設此變數會偶發 segfault。
-#   setdefault：呼叫端若已從外部指定則尊重外部設定。
-os.environ.setdefault("OMP_NUM_THREADS", "1")
+# ============================================================
+#  ★ 2026-07-22：平行化層級開關（預設 False＝可重現）
+# ============================================================
+#  True  ── 平行度放在 Optuna trial 層（n_jobs=_N_CORES、每 trial 單執行緒）。
+#           實測 8 trials / 8 核快 4.05 倍（42.0s vs 170.3s），
+#           但 TPESampler 的抽樣順序受排程影響，
+#           **即使固定 seed 也不再逐次可重現**。
+#  False ── 平行度放在 LightGBM thread 層（單 trial 依序跑、每 trial _N_CORES 執行緒）。
+#           慢，但同 seed 同資料保證跑出同一組超參數與同一份預測。
+#
+#  預設 False。本 repo 的產出（database/experiment/ 的預測值）常被下游實驗
+#  當成「固定的上游」反覆使用——例如只動 backtest 的 rho/beta 實驗，
+#  比較的前提是上游預測不變。若上游不可重現，任何下游對照都被污染。
+#  只有在「這次跑完就丟、純粹想快點看個大概」時才打開。
+_PARALLEL_TRIALS = False
+
+if _PARALLEL_TRIALS:
+    _N_JOBS, _NUM_THREADS = _N_CORES, 1
+else:
+    _N_JOBS, _NUM_THREADS = 1, _N_CORES
+
+# OMP 必須與 _NUM_THREADS 一致：trial 層平行時每個 worker 都得是單執行緒，
+# 否則 n_jobs × num_threads 會超訂 CPU；且 macOS 上多行程情境不設此變數
+# 會偶發 segfault。setdefault：呼叫端若已從外部指定則尊重外部設定。
+os.environ.setdefault("OMP_NUM_THREADS", str(_NUM_THREADS))
 
 _LGB_BASE_PARAMS = {
     "objective":     "regression",
     "metric":        "rmse",
     "verbosity":     -1,
     "boosting_type": "gbdt",
-    # ★ 2026-07-22：單執行緒。實測本資料規模（8.5 萬列 × 67 特徵）LightGBM
-    #   對 thread 沒有擴展性，平行度改放在 trial 層（詳見 study.optimize）。
-    "num_threads":   1,
+    # ★ 2026-07-22：由 _PARALLEL_TRIALS 決定（見上方）。trial 層平行時為 1，
+    #   可重現模式下為 _N_CORES。
+    "num_threads":   _NUM_THREADS,
     # ★ 2026-07-22：max_depth 固定 -1（不限制），移出 _SEARCH_SPACE。
     #   max_depth 是硬上限（depth=d → 葉數 ≤ 2^d），與 num_leaves 同時搜會冗餘：
     #   10 折 walk-forward 實測有 3 折的 num_leaves 完全被蓋掉
@@ -277,13 +297,10 @@ def tune_lgb(
         direction="minimize",
         sampler=optuna.samplers.TPESampler(seed=random_state),
     )
-    # ★ 2026-07-22：平行化改在 trial 層（搭配 _LGB_BASE_PARAMS 的 num_threads=1）。
-    #   實測 8 trials / 8 核：8×1 = 42.0s、4×2 = 65.4s、2×4 = 78.0s、
-    #   1×8（原設定）= 170.3s → 同樣核數快 4.05 倍。LightGBM 在此資料規模對
-    #   thread 沒有擴展性，threads/trial 加到 2 以上反而更慢。
-    #
-    #   ⚠ 代價：n_jobs > 1 時 TPESampler 的抽樣順序受排程影響，即使固定 seed
-    #     也不再逐次可重現。需要完全可重現的定版跑請把 _N_JOBS 設為 1。
+    # ★ 2026-07-22：n_jobs 由 _PARALLEL_TRIALS 決定（見檔案上方）。
+    #   預設 1（可重現）；設 True 時為 _N_CORES，實測 8 trials / 8 核：
+    #   8×1 = 42.0s、4×2 = 65.4s、2×4 = 78.0s、1×8 = 170.3s（快 4.05 倍），
+    #   代價是抽樣順序不再可重現。
     study.optimize(
         objective, n_trials=n_trials, n_jobs=_N_JOBS, show_progress_bar=False
     )
