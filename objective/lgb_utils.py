@@ -80,16 +80,32 @@ _LGB_BASE_PARAMS = {
     "verbosity":     -1,
     "boosting_type": "gbdt",
     "num_threads":   _N_JOBS,
+    # ★ 2026-07-22：max_depth 固定 -1（不限制），移出 _SEARCH_SPACE。
+    #   max_depth 是硬上限（depth=d → 葉數 ≤ 2^d），與 num_leaves 同時搜會冗餘：
+    #   10 折 walk-forward 實測有 3 折的 num_leaves 完全被蓋掉
+    #   （如 num_leaves=957 但 max_depth=3 → 實際只有 8 個葉子），既浪費 trial
+    #   預算，也會讓重要性分析把 num_leaves 誤判為不重要（它常被 max_depth 遮蔽）。
+    #   改由 num_leaves 單獨控制樹複雜度，語意單純。
+    "max_depth":     -1,
 }
 
 _SEARCH_SPACE = {
-    "learning_rate":    ("float_log", 0.005, 0.3),
+    # ★ 2026-07-22：learning_rate 是 300 trials 中 Spearman ρ 唯一顯著的超參數
+    #   （ρ=+0.514，其餘全在雜訊等級），分箱證據顯示 >0.02 幾乎全是爛區
+    #   （0.1~0.3 桶平均 rank 0.896 vs ≤0.005 桶 0.383）。原範圍 [0.005, 0.3]
+    #   約一半 trial 浪費在爛區，收窄到 [0.001, 0.03] 讓預算集中在有效區間。
+    "learning_rate":    ("float_log", 0.001, 0.03),
+    # ρ = −0.013，與目標值幾乎無關；保留原範圍但不值得為它加 trial 預算。
     "num_leaves":       ("int",       16,    512),
     "feature_fraction": ("float",     0.5,   1.0),
     "bagging_fraction": ("float",     0.5,   1.0),
     "bagging_freq":     ("int",       1,     20),
-    "min_data_in_leaf": ("int",       5,     100),
-    "max_depth":        ("int",       5,     20),
+    # ★ 2026-07-22：上界 100 → 600。ρ = −0.23，是唯一次要有訊號的參數，且舊上界
+    #   確實在綁：舊空間 [5,100] 的 10 折觀測值是 41~91（看似未貼界），放寬到 600
+    #   後立刻跑到 144~599。噪音大、樣本少時觀測最大值會系統性低估最適區，
+    #   「沒有貼界」不代表「界沒有在綁」。
+    "min_data_in_leaf": ("int",       5,     600),
+    # max_depth 已移出（見 _LGB_BASE_PARAMS）
 }
 
 
