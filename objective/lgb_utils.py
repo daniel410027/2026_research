@@ -74,12 +74,20 @@ warnings.filterwarnings("ignore")
 # ★ n-2 核平行運算：保留 2 核給系統/其他行程，避免搶占整台機器
 _N_JOBS = max(1, (os.cpu_count() or 1) - 2)
 
+# ★ 2026-07-22：平行層級由 LightGBM thread 改為 Optuna trial（見下方 study.optimize
+#   的 n_jobs）。每個 trial 固定單執行緒，OMP 也必須跟著設 1——macOS 上 LightGBM
+#   與 OpenMP 在多行程情境不設此變數會偶發 segfault。
+#   setdefault：呼叫端若已從外部指定則尊重外部設定。
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 _LGB_BASE_PARAMS = {
     "objective":     "regression",
     "metric":        "rmse",
     "verbosity":     -1,
     "boosting_type": "gbdt",
-    "num_threads":   _N_JOBS,
+    # ★ 2026-07-22：單執行緒。實測本資料規模（8.5 萬列 × 67 特徵）LightGBM
+    #   對 thread 沒有擴展性，平行度改放在 trial 層（詳見 study.optimize）。
+    "num_threads":   1,
     # ★ 2026-07-22：max_depth 固定 -1（不限制），移出 _SEARCH_SPACE。
     #   max_depth 是硬上限（depth=d → 葉數 ≤ 2^d），與 num_leaves 同時搜會冗餘：
     #   10 折 walk-forward 實測有 3 折的 num_leaves 完全被蓋掉
@@ -269,7 +277,16 @@ def tune_lgb(
         direction="minimize",
         sampler=optuna.samplers.TPESampler(seed=random_state),
     )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    # ★ 2026-07-22：平行化改在 trial 層（搭配 _LGB_BASE_PARAMS 的 num_threads=1）。
+    #   實測 8 trials / 8 核：8×1 = 42.0s、4×2 = 65.4s、2×4 = 78.0s、
+    #   1×8（原設定）= 170.3s → 同樣核數快 4.05 倍。LightGBM 在此資料規模對
+    #   thread 沒有擴展性，threads/trial 加到 2 以上反而更慢。
+    #
+    #   ⚠ 代價：n_jobs > 1 時 TPESampler 的抽樣順序受排程影響，即使固定 seed
+    #     也不再逐次可重現。需要完全可重現的定版跑請把 _N_JOBS 設為 1。
+    study.optimize(
+        objective, n_trials=n_trials, n_jobs=_N_JOBS, show_progress_bar=False
+    )
     best_params = study.best_params
     best_fold_losses = list(study.best_trial.user_attrs.get("fold_losses", []))
     print(f"  Best CV RMSE: {study.best_value:.6f}")
