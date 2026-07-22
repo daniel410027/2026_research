@@ -15,6 +15,15 @@ Walk-forward LightGBM 訓練模組（FinLab 新專案版）。
     - 沿用時改呼叫 collect_oof_prob（只跑 CV，不做 Optuna）
     - metrics.json 新增 hyperparams_tuned 欄位標記是否有重新 tune
 
+    [2026-07-22 修正] 上述 freeze_hyperparams / retune_every_n 兩旗標已由單一
+    tune_mode 取代（"every_fold" / "first_only" / "periodic" / "frozen"）：
+    - 舊版 _should_tune 的第一個分支 `if not freeze_hyperparams: return True`
+      會在檢查 _frozen_params 之前就短路，使「預植固定超參數」完全失效——
+      Optuna 照跑、預植參數被靜默丟棄，畫面卻印「Optuna 全程停用」。
+    - frozen 模式改為在 run() 開頭 fail fast（未預植直接拋 RuntimeError）。
+    - 舊旗標若仍被傳入，於 __post_init__ 拋出遷移說明。
+    - metrics.json 另新增 tune_mode 欄位。
+
     [2026 修正] CV 時間軸 bug：
     - 問題：_preprocess_window 以 ["證券代碼","年月日"] 排序（stock-major），
             train_df 沿用該順序丟進 TimeSeriesSplit，導致 CV 折實際在「按股票
@@ -155,11 +164,24 @@ class WalkForwardConfig:
     n_splits:     int = 3
     random_state: int = 42
 
-    # ── 超參數凍結策略 ────────────────────────────────────────
-    # freeze_hyperparams=True：第一個 fold 完整 tune，後續 fold 沿用
-    # retune_every_n：每 N 個 fold 重新 tune 一次（999 = 實質上只 tune 一次）
-    freeze_hyperparams: bool = True
-    retune_every_n:     int  = 999
+    # ── 超參數策略 ────────────────────────────────────────────
+    # ★ 2026-07-22：原本用 freeze_hyperparams(bool) + retune_every_n(int) 兩個旗標
+    #   表達，但兩者交互出的狀態空間有一半是無效的，且 _should_tune 的第一個分支
+    #   會在檢查 _frozen_params 之前就短路，導致 freeze_hyperparams=False 時
+    #   「預植固定超參數」完全失效（Optuna 照跑、預植參數被靜默丟棄，畫面卻印
+    #   「Optuna 全程停用」）。改用單一 tune_mode 列舉，狀態互斥且語意明確。
+    #
+    #   "every_fold" ── 每個 fold 都重跑 Optuna（每年重訓超參）
+    #   "first_only" ── 只有第一個 fold tune，之後所有 fold 凍結沿用
+    #   "periodic"   ── 每 retune_every_n 個 fold 重新 tune 一次
+    #   "frozen"     ── 完全不 tune，用 preload_params() 預植的超參數。
+    #                   未預植就跑會直接拋錯（不會靜默改跑 Optuna）。
+    tune_mode:      str = "first_only"
+    retune_every_n: int = 3        # 僅 tune_mode="periodic" 時有意義
+
+    # ★ 已移除的舊旗標。若舊程式碼仍傳入，於 __post_init__ 拋出遷移說明，
+    #   而不是讓 dataclass 丟一個看不出原因的 TypeError。
+    freeze_hyperparams: bool | None = None
 
     # ── Inverse-Volatility Sample Weighting ───────────────────
     use_vol_weight:  bool  = True
@@ -187,10 +209,30 @@ class WalkForwardConfig:
     tick0_threshold: float = 0.00
     beta_window:     int   = 60
 
+    _TUNE_MODES = ("every_fold", "first_only", "periodic", "frozen")
+
     def __post_init__(self):
         self.output_dir      = Path(self.output_dir)
         self.db_dir          = Path(self.db_dir)
         self.precomputed_dir = Path(self.precomputed_dir)
+
+        if self.freeze_hyperparams is not None:
+            raise ValueError(
+                "freeze_hyperparams 已於 2026-07-22 移除，請改用 tune_mode：\n"
+                "  freeze_hyperparams=False              → tune_mode='every_fold'\n"
+                "  freeze_hyperparams=True, 不預植參數   → tune_mode='first_only'\n"
+                "  freeze_hyperparams=True, 預植參數     → tune_mode='frozen'\n"
+                "                                          + trainer.preload_params(p)\n"
+                "  retune_every_n < 999                  → tune_mode='periodic'\n"
+                "（舊寫法的實際行為與字面意思不符，詳見 summary_research.md 5.1）"
+            )
+
+        if self.tune_mode not in self._TUNE_MODES:
+            raise ValueError(
+                f"tune_mode={self.tune_mode!r} 無效，可選：{self._TUNE_MODES}"
+            )
+        if self.tune_mode == "periodic" and self.retune_every_n < 1:
+            raise ValueError(f"retune_every_n 需 >= 1，得到 {self.retune_every_n}")
 
     def windows(self) -> list[tuple[int, int]]:
         return [(s, s + 2) for s in range(self.window_start, self.window_end - 1)]
@@ -213,9 +255,8 @@ class WalkForwardTrainer:
 
         self._df_cache: dict[tuple[int, int], pd.DataFrame] = {}
 
-        # 超參數凍結快取
+        # 超參數凍結快取（tune_mode="frozen" 時由 preload_params() 填入）
         self._frozen_params: dict | None = None
-        self._fold_counter:  int         = 0   # 計算已執行 fold 數（用於 retune_every_n）
 
     def inject_cache(self, start: int, end: int, df: pd.DataFrame):
         """外部注入已處理的 df，跳過重複前處理。"""
@@ -223,18 +264,38 @@ class WalkForwardTrainer:
         self._df_cache[key] = df.dropna(subset=[self.cfg.target_col])
         print(f"  ✓ 注入 df cache：window ({start}, {end})，形狀 {self._df_cache[key].shape}")
 
+    def preload_params(self, params: dict):
+        """預植固定超參數（tune_mode="frozen" 必須先呼叫）。"""
+        if not params:
+            raise ValueError("preload_params 收到空的超參數")
+        self._frozen_params = dict(params)
+        print(f"  ✓ 已預植固定超參數（{len(self._frozen_params)} 項）")
+
     def run(self):
         windows = self.cfg.windows()
+
+        # ★ fail fast：frozen 模式沒預植參數就直接停，不要靜默改跑 Optuna
+        #   （這正是舊 freeze_hyperparams 版本的 bug，見 summary_research.md 5.1）
+        if self.cfg.tune_mode == "frozen" and self._frozen_params is None:
+            raise RuntimeError(
+                "tune_mode='frozen' 但沒有預植超參數。"
+                "請在 run() 之前呼叫 trainer.preload_params(best_params)，"
+                "或改用 tune_mode='first_only' / 'every_fold'。"
+            )
+
+        _mode_desc = {
+            "every_fold": "每個 fold 都重跑 Optuna",
+            "first_only": "第一個 fold tune，之後凍結沿用",
+            "periodic":   f"每 {self.cfg.retune_every_n} 個 fold 重新 tune 一次",
+            "frozen":     "完全不 tune，使用預植的固定超參數",
+        }[self.cfg.tune_mode]
+
         print(f"\n{'='*60}")
         print(f"  Walk-Forward Training")
         print(f"  Windows : {windows[0]} → {windows[-1]}  ({len(windows)} 個)")
         print(f"  Target  : {self.cfg.target_col}")
         print(f"  Output  : {self.cfg.output_dir}")
-        if self.cfg.freeze_hyperparams:
-            print(f"  超參數策略 : 第一個 fold tune，後續凍結沿用"
-                  f"（retune_every_n={self.cfg.retune_every_n}）")
-        else:
-            print(f"  超參數策略 : 每個 fold 獨立 tune")
+        print(f"  超參數策略 : {self.cfg.tune_mode} — {_mode_desc}")
         print(f"{'='*60}")
 
         all_metrics = []
@@ -279,14 +340,24 @@ class WalkForwardTrainer:
         return df.dropna(subset=[self.cfg.target_col])
 
     def _should_tune(self, fold_index: int) -> bool:
-        """判斷本 fold 是否需要執行 Optuna tuning。"""
-        if not self.cfg.freeze_hyperparams:
-            return True                                    # 從不凍結
+        """判斷本 fold 是否需要執行 Optuna tuning（fold_index 由 1 起算）。"""
+        mode = self.cfg.tune_mode
+
+        if mode == "every_fold":
+            return True
+
+        if mode == "frozen":
+            # 預植檢查已在 run() 開頭做過（fail fast），這裡只是永不 tune。
+            return False
+
+        # first_only / periodic：第一個 fold 一定要 tune 才有參數可用
         if self._frozen_params is None:
-            return True                                    # 尚無凍結參數（第一個 fold）
-        if self.cfg.retune_every_n < 999:
-            return (fold_index % self.cfg.retune_every_n) == 1   # 週期性 re-tune
-        return False                                       # 完全凍結
+            return True
+
+        if mode == "periodic":
+            return (fold_index - 1) % self.cfg.retune_every_n == 0
+
+        return False                                       # first_only，已 tune 過
 
     def _run_window(self, start: int, end: int, fold_index: int = 1) -> dict:
         test_year   = end
@@ -353,12 +424,13 @@ class WalkForwardTrainer:
                 sample_weight = train_weight,
                 dates         = train_dates,
             )
-            if self.cfg.freeze_hyperparams:
-                self._frozen_params = best_params
+            self._frozen_params = best_params
+            if self.cfg.tune_mode in ("first_only", "periodic"):
                 print(f"  [Optuna] 超參數已凍結，後續 fold 沿用")
         else:
             best_params = self._frozen_params
-            print(f"  [Optuna] 沿用凍結超參數，跳過 tune，只收集 OOF 預測值")
+            print(f"  [Optuna] 沿用既有超參數（tune_mode={self.cfg.tune_mode}），"
+                  f"跳過 tune，只收集 OOF 預測值")
             oof_pred = collect_oof_prob(
                 X_train, y_train,
                 best_params   = best_params,
@@ -384,6 +456,7 @@ class WalkForwardTrainer:
             "vol_weight_col":     self.cfg.vol_weight_col if self.cfg.use_vol_weight else None,
             "return_weight_used": self.cfg.use_return_weight,
             "hyperparams_tuned":  do_tune,   # 本 fold 是否重新 tune
+            "tune_mode":          self.cfg.tune_mode,
         })
 
         out_dir = self.cfg.output_dir / f"{start}_{end}"

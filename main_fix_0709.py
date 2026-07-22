@@ -3,27 +3,29 @@ main_fix.py
 ===========
 Walk-Forward Pipeline 入口（靜態研究版）。
 
-超參數模式（RunConfig.TUNE_FIRST_FOLD 切換）：
-    ★ TUNE_FIRST_FOLD = True（預設，regression 改版後建議先跑一次）：
-      第一個 fold 執行 Optuna tune（N_TRIALS 次），之後所有 fold 凍結沿用
-      （即 model.py 原生的 freeze_hyperparams 行為）。
+超參數模式（RunConfig.TUNE_MODE 切換，2026-07-22 改版）：
+    ★ "every_fold"（預設）：每個 fold 都重跑 Optuna（N_TRIALS 次），
+      各折超參數不同。逐折參數見 database/experiment/{window}/best_params.json。
+
+    ★ "first_only"：只有第一個 fold 執行 Optuna，之後所有 fold 凍結沿用。
       tune 出的參數會另存 best_params_regression.json。
 
-    ★ TUNE_FIRST_FOLD = False（原 main_fix 行為）：
-      不使用 Optuna。直接套用 best_params.json（或內嵌 dict）的固定超參數，
-      所有 window 共用同一組超參數。
+    ★ "periodic"：每 RETUNE_EVERY_N 個 fold 重新 tune 一次。
 
-  凍結機制（無需改 model.py / lgb_utils.py）：
-    WalkForwardTrainer 的 _should_tune 在
-        freeze_hyperparams=True、retune_every_n=999、且 _frozen_params 已有值
-    時，對所有 fold 回傳 False → 跳過 tune_lgb、改走 collect_oof_prob
-    （固定超參數下只收集 OOF 預測值供 evaluate_oof_ic 監控）。
-    - tune 模式：不預植 _frozen_params → 第一個 fold 自然觸發 tune，
-      tune 完由 model.py 凍結。
-    - 固定模式：在 trainer.run() 前「預先植入」trainer._frozen_params，
-      Optuna 即一次都不會執行。
+    ★ "frozen"：完全不使用 Optuna，直接套用 best_params.json（或內嵌 dict）
+      的固定超參數，所有 window 共用同一組。
 
-    其餘行為兩模式相同：
+  ⚠ 舊版用 TUNE_FIRST_FOLD(bool) 表達，但字面意思與實際行為不符：
+    它同時對 WalkForwardConfig 傳 freeze_hyperparams=False，而
+    model._should_tune 的第一個分支會在檢查 _frozen_params 之前就短路 →
+      - TUNE_FIRST_FOLD=True  實際上是「每個 fold 都 tune」（非「第一折後凍結」），
+        存出的 best_params_regression.json 其實是最後一折的參數；
+      - TUNE_FIRST_FOLD=False 的預植參數被完全忽略，Optuna 照跑，
+        best_params.json 被靜默丟棄，畫面卻印「Optuna 全程停用」。
+    現行 TUNE_MODE="every_fold" 即舊版 TUNE_FIRST_FOLD=True 的實際行為，
+    換寫法不改結果。詳見 summary_research.md 5.1。
+
+    其餘行為各模式相同：
       - final model 仍用 train_final_lgb 預設 500 輪
       - OOF Spearman IC 仍由 collect_oof_prob 的 OOF 預測值計算（監控用，無 threshold）
       - 特徵集對齊（排除 amount 等）同 main.py
@@ -144,14 +146,21 @@ class RunConfig:
     RUN_ML          = True
 
     # ── ★ 超參數模式 ─────────────────────────────────────────
-    # TUNE_FIRST_FOLD = True  → 第一個 fold 執行 Optuna tune（N_TRIALS 次），
-    #                           之後所有 fold 凍結沿用；tune 結果會另存
-    #                           best_params_regression.json 供後續固定參數重跑。
-    # TUNE_FIRST_FOLD = False → 完全不 tune，直接用下方固定超參數（原行為）。
-    TUNE_FIRST_FOLD = True
+    # ★ 2026-07-22：原本的 TUNE_FIRST_FOLD(bool) 換成 TUNE_MODE 字串。
+    #   舊寫法的字面意思（「第一個 fold tune 後凍結」）與實際行為不符——
+    #   它同時傳 freeze_hyperparams=False，導致每個 fold 都重跑 Optuna。
+    #   下面的預設值 "every_fold" 就是**舊版實際跑的行為**，換寫法不改結果。
+    #
+    #   "every_fold" ── 每個 fold 都重跑 Optuna（每年重訓超參，現行預設）
+    #   "first_only" ── 只有第一個 fold tune，之後凍結沿用
+    #   "periodic"   ── 每 RETUNE_EVERY_N 個 fold 重新 tune 一次
+    #   "frozen"     ── 完全不 tune，用下方固定超參數
+    #                   （來源：BEST_PARAMS_INLINE 或 BEST_PARAMS_PATH）
+    TUNE_MODE       = "every_fold"
+    RETUNE_EVERY_N  = 3      # 僅 TUNE_MODE="periodic" 時有意義
     N_TRIALS        = 15
 
-    # ── ★ 固定超參數（TUNE_FIRST_FOLD=False 時使用）──────────
+    # ── ★ 固定超參數（TUNE_MODE="frozen" 時使用）─────────────
     # BEST_PARAMS_INLINE 不為 None → 優先使用內嵌 dict；
     # 否則讀 BEST_PARAMS_PATH（best_params.json）。
     BEST_PARAMS_PATH   = Path("best_params.json")
@@ -453,13 +462,17 @@ def align_features_with_live(cfg: RunConfig):
 
 def run_ml(cfg: RunConfig):
     # ── ★ 超參數決策 ─────────────────────────────────────────
-    if cfg.TUNE_FIRST_FOLD:
-        print("\n► 超參數模式：第一個 fold Optuna tune"
-              f"（{cfg.N_TRIALS} trials），之後凍結沿用")
-        best_params = None
-    else:
-        print("\n► 固定超參數（不使用 Optuna）")
+    if cfg.TUNE_MODE == "frozen":
+        print("\n► 超參數模式：frozen（不使用 Optuna，套用固定超參數）")
         best_params = load_best_params(cfg)
+    else:
+        _desc = {
+            "every_fold": "每個 fold 都重跑 Optuna",
+            "first_only": "第一個 fold tune，之後凍結沿用",
+            "periodic":   f"每 {cfg.RETUNE_EVERY_N} 個 fold 重新 tune 一次",
+        }[cfg.TUNE_MODE]
+        print(f"\n► 超參數模式：{cfg.TUNE_MODE}（{cfg.N_TRIALS} trials）— {_desc}")
+        best_params = None
 
     # ── ★ 訓練特徵集對齊（必須在 trainer.run() 之前）──────────
     if cfg.ALIGN_FEATURES_WITH_LIVE:
@@ -475,38 +488,39 @@ def run_ml(cfg: RunConfig):
 
     print("\n► Walk-Forward Training")
     ml_config = WalkForwardConfig(
-        window_start       = cfg.ML_WINDOW_START,
-        window_end         = cfg.ML_WINDOW_END,
-        precomputed_dir    = train_precomputed_dir,
-        target_col         = cfg.LABEL,
-        n_trials           = cfg.N_TRIALS,
-        use_vol_weight     = False,
-        use_return_weight  = cfg.USE_RETURN_WEIGHT,
-        freeze_hyperparams = False,   # 第一個 fold 之後凍結（或配合預植全程凍結）
-        retune_every_n     = 999,    # 完全凍結，永不 re-tune
+        window_start      = cfg.ML_WINDOW_START,
+        window_end        = cfg.ML_WINDOW_END,
+        precomputed_dir   = train_precomputed_dir,
+        target_col        = cfg.LABEL,
+        n_trials          = cfg.N_TRIALS,
+        use_vol_weight    = False,
+        use_return_weight = cfg.USE_RETURN_WEIGHT,
+        tune_mode         = cfg.TUNE_MODE,
+        retune_every_n    = cfg.RETUNE_EVERY_N,
     )
     trainer = WalkForwardTrainer(ml_config)
 
-    if cfg.TUNE_FIRST_FOLD:
-        # 不預植 _frozen_params → _should_tune 在第一個 fold 回傳 True
-        # → 第一個 fold 執行 Optuna，tune 完由 model.py 自動凍結供後續沿用。
-        print("  ✓ 第一個 fold 將執行 Optuna，之後自動凍結")
-    else:
-        # ── 預先植入凍結超參數 → _should_tune 對所有 fold 回傳 False ──
-        #    → tune_lgb 一次都不執行，改走 collect_oof_prob（固定參數收集 OOF）。
-        trainer._frozen_params = best_params
-        print("  ✓ 已植入固定超參數，Optuna 全程停用")
+    if cfg.TUNE_MODE == "frozen":
+        # 預植固定超參數 → _should_tune 對所有 fold 回傳 False。
+        # 若忘了給參數，run() 會直接拋 RuntimeError（不會靜默改跑 Optuna）。
+        trainer.preload_params(best_params)
 
     trainer.run()
 
-    # ── ★ tune 模式：另存本次 tune 出的參數，供之後固定參數重跑 ──
-    if cfg.TUNE_FIRST_FOLD and trainer._frozen_params:
+    # ── ★ 另存 tune 出的參數，供之後 TUNE_MODE="frozen" 重跑 ──
+    #    注意：every_fold / periodic 模式下每折的參數都不同，這裡存的是
+    #    **最後一折**的參數，不代表全程使用的超參數。逐折參數請看
+    #    database/experiment/{window}/best_params.json。
+    if cfg.TUNE_MODE == "first_only" and trainer._frozen_params:
         out_path = Path("best_params_regression.json")
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(trainer._frozen_params, f, ensure_ascii=False, indent=2)
         print(f"\n  ✓ 本次 tune 出的超參數已另存：{out_path}")
-        print(f"    （之後可設 TUNE_FIRST_FOLD=False 並將 BEST_PARAMS_PATH 指向此檔，"
+        print(f"    （之後可設 TUNE_MODE=\"frozen\" 並將 BEST_PARAMS_PATH 指向此檔，"
               f"跳過 tune 快速重跑）")
+    elif cfg.TUNE_MODE in ("every_fold", "periodic"):
+        print(f"\n  ▸ TUNE_MODE={cfg.TUNE_MODE}：各折超參數不同，未另存單一檔案。"
+              f"逐折參數見 {ml_config.output_dir}/{{window}}/best_params.json")
 
 
 def main():
@@ -517,10 +531,10 @@ def main():
     print(f"  資料來源  : {cfg.PRECOMPUTED_DIR}/")
     print(f"  年份範圍  : {cfg.ML_WINDOW_START} ~ {cfg.ML_WINDOW_END}")
     print(f"  Label     : {cfg.LABEL}")
-    if cfg.TUNE_FIRST_FOLD:
-        print(f"  Optuna    : 第一個 fold tune（{cfg.N_TRIALS} trials）→ 之後凍結")
+    if cfg.TUNE_MODE == "frozen":
+        print(f"  Optuna    : 停用（TUNE_MODE=frozen，固定超參數）")
     else:
-        print(f"  Optuna    : 停用（固定超參數）")
+        print(f"  Optuna    : TUNE_MODE={cfg.TUNE_MODE}（{cfg.N_TRIALS} trials）")
     print(f"  對齊 live  : {cfg.ALIGN_FEATURES_WITH_LIVE}")
     if cfg.LIQ_FILTER_ENABLED:
         print(f"  流動性篩選: 開啟（formula3  w1={cfg.LIQ_W1}  w2={cfg.LIQ_W2}  "
