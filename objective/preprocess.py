@@ -108,6 +108,8 @@ class DataPreprocessor(FeatureMixin):
             ("Short Selling",                  self._add_short_selling_features),
             # 風險特徵（依賴 daily_return；beta 需在 CAPM beta 前完成）
             ("Beta / Vol20",                   self._add_beta_vol_features),
+            # delay1 反轉/微結構/流動性因子（依賴 vol20 + amount，排在 Beta/Vol20 後）
+            ("Delay1 Microstructure",          self._add_delay1_microstructure_features),
             ("CAPM Beta Extended",             self._add_capm_beta_extended),
             # Return Labels（最後執行；drop market_return_fwd）
             ("Return Labels",                  self._add_return_features),

@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from ._base import _FeatureHelperMixin, _CLOSE, _RCLOSE, _HIGH, _LOW, _OPEN, _VOL
+from ._base import _FeatureHelperMixin, _CLOSE, _RCLOSE, _HIGH, _LOW, _OPEN, _VOL, _AMT
 
 
 class PriceReturnFeaturesMixin(_FeatureHelperMixin):
@@ -166,6 +166,51 @@ class PriceReturnFeaturesMixin(_FeatureHelperMixin):
         )
 
         print("    多期間報酬率: 報酬率Ln / 近一月/季/年 / YTD / MTD / WTD / QTD ✓")
+
+    # ──────────────────────────────────────────────────────────
+    #  delay1 反轉／微結構／流動性因子
+    # ──────────────────────────────────────────────────────────
+
+    def _add_delay1_microstructure_features(self):
+        """delay1 反轉／微結構／流動性因子（2026-07-23 由 1003_delay1 IC/corr 篩選 +
+        重訓對照選入；D1 Sharpe 3.73→3.91、OOF IC 0.092→0.097、MDD −30%→−27%）。
+
+        動機：D1 day-1 P&L 有八成與純個股 1 日反轉同向（載荷 0.76），但控制反轉後
+        仍留 95%/yr 正交 alpha → 補既有 報酬率1（≈收盤對收盤反轉）沒涵蓋的維度。
+        5 個因子皆只用 ≤ 收盤[T] 資訊（無前視）：
+
+          rev_5d        = -(adj_open_t / adj_open_{t-5} - 1)              5 日開盤反轉（不同 horizon）
+          ov_night_1d   = adj_open_t / adj_close_{t-1} - 1               隔夜跳空（隔夜 SOX/美股微結構）
+          intraday_1d   = adj_close_t / adj_open_t - 1                   日內（日內反轉遠強於隔夜）
+          rev_volscaled = -(adj_open_t/adj_open_{t-1}-1)/(|vol20|+eps)   波動正規化反轉（stat-arb 標準）
+          illiq_amihud  = rolling5 mean(|cc_ret| / log1p(amount))        Amihud 流動性（反轉放大器）
+
+        依賴 vol20（_add_beta_vol_features）與 amount → 須排在 _add_beta_vol_features 之後。
+        不 fillna（保留 NaN，LightGBM 原生處理；與 1003_delay1 重訓驗證版一致）。
+        """
+        if not self._require_cols(_OPEN, _CLOSE, _AMT, "vol20"):
+            return False
+
+        g = self.df.groupby("證券代碼")
+        o, c = self.df[_OPEN], self.df[_CLOSE]
+
+        self.df["rev_5d"] = (
+            g[_OPEN].transform(lambda x: -(x / x.shift(5) - 1)).clip(-0.5, 0.5)
+        )
+        self.df["ov_night_1d"] = (o / g[_CLOSE].shift(1) - 1).clip(-0.5, 0.5)
+        self.df["intraday_1d"] = (c / (o + 1e-9) - 1).clip(-0.5, 0.5)
+
+        rev_oo = g[_OPEN].transform(lambda x: -(x / x.shift(1) - 1))
+        self.df["rev_volscaled"] = (rev_oo / (self.df["vol20"].abs() + 1e-6)).clip(-25, 25)
+
+        cc_ret = g[_CLOSE].transform(lambda x: (x / x.shift(1) - 1)).abs()
+        amihud = cc_ret / np.log1p(self.df[_AMT].clip(lower=0))
+        self.df["illiq_amihud"] = (
+            amihud.groupby(self.df["證券代碼"])
+                  .transform(lambda s: s.rolling(5, min_periods=3).mean())
+        )
+        print("    delay1 微結構因子: rev_5d / ov_night_1d / intraday_1d / "
+              "rev_volscaled / illiq_amihud ✓")
 
     # ──────────────────────────────────────────────────────────
     #  Return Labels（含 excess_return）
