@@ -351,9 +351,12 @@ def calc_metrics(
     IR    : alpha / tracking_error_annualised
     """
     r = ret_series.dropna()
-    ann_ret = (1 + r).prod() ** (annual_days / len(r)) - 1
+    ann_ret = (1 + r).prod() ** (annual_days / len(r)) - 1   # 幾何年化(CAGR)：報酬顯示 / Calmar / alpha 用
     ann_std = r.std() * np.sqrt(annual_days)
-    sharpe  = ann_ret / ann_std if ann_std > 0 else np.nan
+    # ★ 2026-07-23：Sharpe 改用標準定義＝算術年化報酬 /(σ×√252)，分子分母同基準。
+    #   舊版分子誤用 CAGR(複利)、分母用 σ×√252(不複利)，高報酬時系統性灌水
+    #   （D1 6.51 → 3.73，1.75 倍；大盤幾乎不變）。詳見 summary_research §6.3 / §9-#8。
+    sharpe  = (r.mean() * annual_days) / ann_std if ann_std > 0 else np.nan
     cum     = (1 + r).cumprod()
     rolling_max = cum.cummax()
     drawdown    = (cum - rolling_max) / rolling_max
