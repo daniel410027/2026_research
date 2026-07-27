@@ -44,12 +44,14 @@ namespace——同一個資料夾內本來就只跑一種設定。
 ## 1. 怎麼跑
 
 ```bash
-.venv/bin/python main_fix_0709.py     # walk-forward 訓練 → database/experiment/
-.venv/bin/python backtest_0709.py     # 依預測值回測 → output/backtest/
+.venv/bin/python main_fix_0709.py            # walk-forward 訓練 → database/experiment/
+.venv/bin/python backtest_0709.py            # 依預測值回測 → output/backtest/
+.venv/bin/python tools/check_objective_sync.py   # 與 2026_daily 的 objective/ 對拍（見 7.1）
 ```
 
-所有設定集中在 `main_fix_0709.py` 的 `RunConfig` class，直接改該 class 的屬性，
-不吃命令列參數。常動的幾個：
+所有設定集中在 **`objective/research_config.py` 的 `RunConfig` class**
+（✅ 2026-07-27 由 `main_fix_0709.py` 搬進 package，見 3.7），不吃命令列參數。
+常動的幾個：
 
 | 屬性 | 現值 | 意義 |
 |---|---|---|
@@ -114,8 +116,9 @@ print('已補指紋:', d)"
 
 兩層機制，基底清單在 `objective/model.py`，實驗要加的部分走 config（見 3.3）：
 
-- `_EXCLUDE_COLS`：精確欄名比對。基底 11 欄 + `RunConfig.EXTRA_EXCLUDE_COLS`
-  經 `WalkForwardConfig.extra_exclude_cols` 疊上去，共 15 欄。
+- `_EXCLUDE_COLS`：精確欄名比對。基底 13 欄（★ 2026-07-27 新增 `clu_id_daily`、
+  `clu_valid`，與 daily 對齊）+ `RunConfig.EXTRA_EXCLUDE_COLS` 經
+  `WalkForwardConfig.extra_exclude_cols` 疊上去，共 16 欄。
 - `_EXCLUDE_PREFIXES`：前綴比對，目前只有 `"clu_id"`（可用
   `extra_exclude_prefixes` 疊加）。
 
@@ -127,6 +130,7 @@ print('已補指紋:', d)"
 | `market_value`, `close` | **外部條件變數**：要研究 size/price × 模型訊號的交互效果，讓模型先看過就變循環論證 |
 | `amount` | 只作流動性過濾用 |
 | `clu_id*` | 群組編號是任意標籤，跨期 label switching 無對應意義 |
+| `clu_valid` | 與「`clu_` 是否缺失」100% 冗餘（importance 恆為 0），見 6.4 |
 | `market_return` | per-day constant（日期指紋）→ **與 daily 分歧，見 7.2** |
 
 ### 3.2 流動性篩選（universe）
@@ -243,6 +247,54 @@ Optuna」——而當時**沒辦法篩出哪些舊產出受影響**，只能全�
 實作 `objective/run_manifest.py`。每個區段各自 try/except——**寫 manifest 絕不可以
 弄掉一次跑了 40 分鐘的訓練**，失敗只印警告。
 
+### 3.7 設定住在 package 裡，不住在入口腳本裡（🆕 2026-07-27）
+
+`RunConfig` 已從 `main_fix_0709.py` 搬到 **`objective/research_config.py`**。
+形狀對齊 `2026_daily` 的 `daily_model/model_config.py`——那邊的設定一直在 package
+內，research 這邊卻長在入口腳本裡。
+
+**理由跟 3.3 拆 monkeypatch 是同一個。** 本 repo 的實驗是整包複製資料夾（§0.1），
+而且複製後常另寫一支 `main_fix_*.py`。設定長在入口腳本時，每個副本、每支新入口
+都各自 fork 一份預設值：之後在本資料夾修好的東西（快取指紋驗證、排除清單、
+`LIQ_CACHE_STRICT_HASH`…）不會被新入口繼承，得靠人記得抄——而「靠人記得抄」
+在 §7.1 已經證明會漏。
+
+新實驗要改設定時**繼承後覆寫**，不要去改 `research_config.py` 本身（改那裡等於
+動所有實驗的基準）：
+
+```python
+from objective.research_config import RunConfig
+
+class MyRunConfig(RunConfig):
+    LIQ_KEEP_RATIO = 0.15
+    N_TRIALS       = 30
+
+cfg = MyRunConfig()
+```
+
+⚠ 行為等價：搬移前後 `RunConfig` 的每個屬性值逐項相同（class body 原樣搬移），
+`main_fix_0709.py` 只是改成 import。**這一項不影響任何數字。**
+
+`research_config.py` 是 research 專屬檔（daily 的對應物在 `daily_model/` 底下，
+不在 `objective/`），已列入對拍工具的 `RESEARCH_ONLY` 白名單。
+
+### 3.8 `clu_` 保留 NaN，其餘 `fillna(0)`（✅ 2026-07-27，修掉舊 §6.2）
+
+訓練矩陣的填補改為有選擇性：`objective/model.py::_fill_missing()` 對
+`_KEEP_NAN_PREFIXES = ("clu_",)` 的欄位保留 NaN 交給 LightGBM 原生缺失分支，
+其餘維持 `fillna(0)`。同時把 `clu_valid` 加進 `_EXCLUDE_COLS`。
+
+從 `2026_daily` 移植（daily 07-22 就改了、research 落後五天）。詳細理由見 6.2、6.4：
+0 落在 `clu_` 特徵的合法值域內，`fillna(0)` 等於送進哨兵值，而那個缺失模式本身
+帶真實資訊（「這檔不屬於 clu 穩定核心」），於是缺失指示變數與 clu 的實際內容被
+混在同一組欄位裡。`clu_valid` 則與缺失模式 100% 冗餘（importance 恆為 0）。
+
+⚠ **這一項會改變訓練結果**：排除清單 15 → 16 欄、訓練特徵 74 → 73 個，
+且 clu_ 欄位的樹分裂行為改變。§5 baseline 已依此重跑（見 5.6）。
+
+⚠ 只動訓練矩陣的填補。`objective/features/*.py` 裡的 `fillna(0)` 是特徵構造的
+一部分，語意不同，沒有跟著改（見 6.2 末段）。
+
 ## 4. 超參數：已確立的結論
 
 來源：`1001_hyper_rhobeta` 的 300-trial walk-forward 研究（2026-07-21）。
@@ -353,6 +405,11 @@ trial 層平行同樣核數快 **4.05 倍**，但 **`n_jobs > 1` 時 TPESampler 
 ---
 
 ## 5. 當前 baseline（2026-07-22，macro 修復後）
+
+> ⚠ **2026-07-27：本節 5.1–5.5 的數字是 `clu_` 改為保留 NaN 之前跑的**
+> （見 3.8）。訓練特徵由 74 → 73 個、`clu_` 欄位的分裂行為改變 → **最新基準見
+> 5.6**，那才是之後實驗該比較的對象。5.1–5.5 保留為改動前的紀錄與各項對照實驗
+> 的當時脈絡，不要直接拿來跟 5.6 之後的新實驗比。
 
 **這是之後每個實驗該比較的基準。** 設定：`_PARALLEL_TRIALS=False`（可重現）、
 `TUNE_MODE="every_fold"`、`N_TRIALS=15`、74 個訓練特徵、
@@ -561,7 +618,15 @@ Optuna）；新增 `preload_params()` 取代直接戳 `trainer._frozen_params`�
 ⚠ **但既有的舊結果仍需重新確認**：任何宣稱「用固定超參數跑」的產出，實際上跑的
 是 Optuna。
 
-### 6.2 `fillna(0)` 破壞 LightGBM 原生缺失值處理 🟡 未修
+### 6.2 `fillna(0)` 破壞 LightGBM 原生缺失值處理 ✅ 已於 2026-07-27 修正
+
+**修法**（從 `2026_daily` 移植，daily 07-22 就有、research 落後五天）：
+`objective/model.py` 新增 `_KEEP_NAN_PREFIXES = ("clu_",)` 與 `_fill_missing()`，
+`clu_` 系列保留 NaN 交給 LightGBM 原生缺失分支，其餘欄位維持 `fillna(0)`；
+`clu_valid` 一併加進 `_EXCLUDE_COLS`（與缺失模式 100% 冗餘，見 6.4）。
+設計與影響見 3.8，重跑後的數字見 5.6。
+
+以下是原始問題描述（保留）：
 
 `objective/model.py` 的 `X_train/X_test = ...fillna(0)` 把「缺失」壓成「值 = 0」。
 對值域不含 0 的特徵等於送進一個乾淨的哨兵值——例如 `clu_rank_ret_1` 真實值域
@@ -604,7 +669,15 @@ sharpe = (r.mean() * annual_days) / ann_std   # 標準：算術年化 /(σ×√2
 ⚠ 舊產出的 `output/backtest/decile_metrics.csv` 的 `sharpe` 欄仍是舊值，**需重跑
 `backtest_0709.py` 才會更新**。任何引用舊報表 Sharpe 的地方要換算。
 
-### 6.4 `clu_*` 的缺失模式編碼了流動性穩定度 🟡 未修
+### 6.4 `clu_*` 的缺失模式編碼了流動性穩定度 🟡 部分處理（2026-07-27）
+
+> ✅ **前提條件已修**：本節末段說「若日後要認真使用，正確做法是**先修 `fillna(0)`
+> （見 6.2）讓缺失回歸缺失**」——那件事 2026-07-27 已完成（見 3.8），`clu_` 現在
+> 保留 NaN，缺失指示變數不再被 `fillna(0)` 一刀切出來。`clu_valid`（與缺失模式
+> 100% 冗餘）也已排除。
+> 🟡 **仍未做**：本節建議的「整組排除 9 個欄位」沒有執行——前提修掉之後，
+> 那 6 個 `clu_rank_ret_*` / `clu_rel_vol_*` 值不值得留是個可重測的問題，
+> 不再是「一定要排掉」。要下結論就跑一次成對實驗（列在 §8）。
 
 > ⚠ **本節於 2026-07-22 更正。** 1001_hyper_rhobeta 的 summary_v1 把這件事描述為
 > 「clu 是在**另一套宇宙**上算的、與 formula3 不同」，依據是「兩者都約 19%、交集只有
@@ -656,28 +729,63 @@ sharpe = (r.mean() * annual_days) / ann_std   # 標準：算術年化 /(σ×√2
 
 ## 7. 與 2026_daily 的關係
 
-### 7.1 同步狀態（2026-07-22）
+### 7.1 同步狀態（2026-07-27）
 
-兩邊 `objective/` 是**人工同步的兩份副本**，沒有任何自動檢查，而且已經證明會漏。
-（下表已於 2026-07-27 更新；`min_data_in_leaf` 上界與平行化開關在 07-24 已回推 daily。）
+兩邊 `objective/` 是**人工同步的兩份副本**。以前沒有任何自動檢查，而且已經證明會漏
+（`min_data_in_leaf` 上界 100→600 漏了三天）。
+
+✅ **對拍已自動化（2026-07-27）**：
+
+```bash
+.venv/bin/python tools/check_objective_sync.py          # 預設抓 ../2026_daily
+.venv/bin/python tools/check_objective_sync.py --daily /path/to/2026_daily
+```
+
+比的是 **AST 等價**不是 byte 等價：註解與 docstring 一律忽略——兩邊的 provenance
+註解措辭本來就不同（「2026-07-24（2026_research 移植）」vs「2026-07-22」），
+byte diff 會被這種噪音淹掉，那正是以前沒人願意定期做對拍的原因。差異報到
+**top-level 符號**層級，直接看得出是哪一個常數或哪一個函式不同步。
+
+刻意分歧走 `INTENTIONAL` 白名單，每條都要寫理由；白名單命中會**印出來而不是靜默
+略過**，理由過期時看得到。exit code 0 = 無真落差，1 = 有。
 
 | | 2026_daily | 2026_research |
 |---|---|---|
 | `max_depth` 固定 −1 | ✅ 07-21 | ✅ 07-22 |
 | `learning_rate` [0.001, 0.03] | ✅ 07-21 | ✅ 07-22 |
-| `min_data_in_leaf` 上界 600 | ❌ 仍 100 | ✅ 07-22 |
-| trial 層平行開關 | ❌（固定全核 thread） | ✅ 07-22（`_PARALLEL_TRIALS`，預設關） |
-| `clu_id*` 前綴排除 | 部分（列舉 `clu_id_daily`） | ✅ 前綴 |
+| `min_data_in_leaf` 上界 600 | ✅ 07-24 | ✅ 07-22 |
+| trial 層平行開關 | ✅ 07-24 | ✅ 07-22（`_PARALLEL_TRIALS`，預設關） |
+| `clu_id*` 前綴排除 | 刻意留空（列舉欄名已足夠） | ✅ 前綴 |
 | `feature_mixin` 拆 `features/` | ✅ | ✅ |
 | regression 改版 | ✅ | ✅ |
 | 流動性公式收進 `objective/liquidity.py` | ✅ 07-27 | ✅ 07-27 |
 | 排除清單走 config（非 monkeypatch） | ✅ 07-27 | ✅ 07-27 |
 | `run_manifest.json` | ✅ 07-27 | ✅ 07-27（僅離線回測路徑） |
+| `clu_` 保留 NaN（`_KEEP_NAN_PREFIXES`）| ✅ 07-22 | ✅ 07-27（見 3.8）|
+| `objective/cluster_features.py` | ✅ | ✅ 07-27（byte 一致，research 不呼叫，純為對拍同形）|
+| `tune_mode` 四模式（修 §6.1）| ✅ 07-27 回推 | ✅ 07-22 |
+| `_daily_ic()`（逐日 IC）| ✅ 07-27 回推 | ✅ 07-27 |
+| 設定放 package（非入口腳本）| ✅ `daily_model/model_config.py` | ✅ 07-27 `objective/research_config.py`（見 3.7）|
 
-其中 `min_data_in_leaf` 上界、平行化開關、`clu_id*` 前綴這三項是 research 領先，
-驗過之後值得回推 daily。**回推時做定點移植，不要整包覆蓋**——兩邊 `_EXCLUDE_COLS`
+⚠ **`tune_mode` / `_daily_ic` 那兩列是對拍工具第一次跑就抓到的**，而且**兩份
+summary 先前都寫錯**——daily `summary.md` §8 說「model.py 刻意分歧只在
+`_EXCLUDE_*`」，實際上 daily 的 `objective/model.py::WalkForwardTrainer` 還帶著
+§6.1 那個壞掉的凍結機制（`freeze_hyperparams` 短路、宣稱凍結實際照跑 Optuna）。
+✅ **已於 2026-07-27 回推 daily**（見 7.3），對拍現在是乾淨的。
+
+回推方式：把 research 的 `model.py` 整份複製過去，再還原 daily 的刻意分歧
+（`_EXCLUDE_PREFIXES = ()`）與 provenance 註解措辭——這樣 `WalkForwardConfig` /
+`WalkForwardTrainer` / `_daily_ic` 保證逐字相同，不會像手抄那樣漏東西。
+daily 端已實測四個 `tune_mode` 的分支行為、舊旗標遷移錯誤、`frozen` fail-fast
+都正確，且**預設值 `first_only` 等於 daily 舊的 `freeze_hyperparams=True` +
+`retune_every_n=999`，預設行為不變**。daily 沒有任何呼叫端建構
+`WalkForwardConfig`（只有 `objective/__init__.py` 的 re-export），所以簽名變更
+不影響既有腳本。
+
+其中 `clu_id*` 前綴是 research 專屬（見上表）。
+**回推時做定點移植，不要整包覆蓋**——兩邊 `_EXCLUDE_PREFIXES`
 有意分歧（見 7.2），research 另有 `main_fix_0709.py`、`backtest_0709.py`、
-`database_make_liq_filtered/` 等 daily 沒有的東西。
+`research_config.py`、`database_make_liq_filtered/` 等 daily 沒有的東西。
 
 ⚠ 因為實驗是整個資料夾複製出去的（見 0.1），**回推 daily 時要從這個資料夾拿，
 不要從某個實驗副本拿**——副本裡的 `objective/` 通常混了該實驗自己的改動。
@@ -721,7 +829,17 @@ daily 的 `FIXED_PARAMS` 是在**舊搜尋空間**下校準的：`learning_rate=
 
 重新校準要跑 walk-forward，天生屬於本 repo。
 
----
+**✅ 2026-07-27 已完成兩項回推**（對拍工具抓到，見 7.1）：
+
+1. **`tune_mode` 四模式**。daily 原本仍是 `freeze_hyperparams` + `retune_every_n`，
+   帶著 §6.1 那個「宣稱凍結、實際照跑 Optuna」的短路 bug。已移植，含
+   `preload_params()`、`frozen` 的 `RuntimeError` fail-fast、舊旗標遷移說明。
+2. **`_daily_ic()`**。daily 的 `metrics.json` 現在也有 `ic_daily` / `ic_daily_t` /
+   `ic_n_days`；`ic`（pooled）欄保留不動，舊產出仍可比。
+
+兩項都只碰 `objective/model.py` 的離線回測路徑，**沒有動 `run_all.py` 的每日排程**
+（每日走 `daily_model/trainer.py`，未改）。daily 端 `objective/model.py` 的既有
+`database/experiment/` 產出：daily 目前沒有這個目錄，無須作廢。
 
 ## 8. Backlog（未確立 / 值得做）
 
@@ -730,13 +848,16 @@ daily 的 `FIXED_PARAMS` 是在**舊搜尋空間**下校準的：`learning_rate=
 1. **重新校準超參數交回 daily**（見 7.3）——目前線上跑在爛區。
 2. **`market_return` 是真 regime 訊號還是日期指紋**（見 7.2 的實驗設計）——
    同時也解掉兩邊無法比較的問題。順帶檢驗 `sox_zscore20` 純常數項是否必要。
-3. **objective 對拍檢查**——加個 `diff` script 比對本資料夾與 `2026_daily` 的
-   `objective/`，人工同步已經證明會漏。（2026-07-27 前置作業已做：流動性公式從
-   入口腳本收進 `objective/liquidity.py`，否則對拍照不到它——那條公式決定訓練
-   universe，兩端一分歧所有 IC/Sharpe 比較就失去意義。對拍時要帶一份「允許分歧
-   清單」：`model.py` 的 `market_return`（見 7.2）、`preprocess.py` 的 delay1
-   接線位置（架構差異，見 daily summary §8）。）
-4. **`clu_*` 整組排除**（見 6.4）——注意「對齊宇宙」這個舊說法已作廢，宇宙沒有錯位。
+3. ~~**objective 對拍檢查**~~ ✅ **2026-07-27 完成**，見 7.1
+   （`tools/check_objective_sync.py`）。第一次跑就抓到 daily 端漏掉 `tune_mode`
+   與 `_daily_ic`，兩份 summary 先前都寫錯。
+4. **`clu_*` 6 個特徵留不留，重測**（見 6.4）——⚠ 這條的性質在 2026-07-27 變了。
+   原本主張「整組排除 9 欄」的三個理由中，(c)「缺失模式與 `fillna(0)` 交互產生
+   假的流動性指示變數」已經因為 3.8 消失；剩下的 (a)「先前實驗判定沒幫助」與
+   (b)「移除代價 test IC −0.0009」本來就都在雜訊等級，撐不起「一定要排掉」。
+   → 改為**成對實驗**：`extra_exclude_cols` 加/不加那 6 個 `clu_rank_ret_*` /
+   `clu_rel_vol_*`，同 seed 同 config 跑兩輪比 daily IC 與標準 Sharpe。
+   注意「對齊宇宙」這個更早的說法已作廢（宇宙沒有錯位，見 6.4 開頭的更正）。
 5. **多 seed 驗證 objective 選擇**（見 4.3）——3–5 seed 才能定案 RMSE vs IC。
 6. **OOF IC 已不可用於選擇** 🆕。macro 修復後 `corr(oof_ic, test_ic)` 從 +0.602 掉到
    **−0.112**（見 5.1），OOF IC 本身則從 0.0685 升到 0.1255。成因清楚：OOF IC 是

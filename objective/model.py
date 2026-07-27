@@ -114,6 +114,13 @@ _EXCLUDE_COLS = {
     "market_return_fwd",
     "amount", "close",
     "market_value",
+    # ★ 2026-07-27（2026_daily 移植）：daily 端 07-17 起就排除這兩欄，research
+    #   一直沒跟上。clu_id_daily 在本 repo 已被 _EXCLUDE_PREFIXES 的 "clu_id"
+    #   蓋掉（列在這裡是為了與 daily 同形，不改變行為）；真正的行為變更是
+    #   clu_valid——§6.4 實測 `clu_valid==1` 的集合與「clu_ 有值」的集合逐筆
+    #   完全相同（2021 年 45,766/45,766 一筆不差），在 clu_ 改為保留 NaN 之後
+    #   它與缺失模式 100% 冗餘（importance 恆為 0）。
+    "clu_id_daily", "clu_valid",
 }
 
 # ★ 2026-07-22：前綴排除。606_corr 的群組編號欄名跨期會變（2017–2023 為
@@ -125,6 +132,29 @@ _EXCLUDE_COLS = {
 _EXCLUDE_PREFIXES = (
     "clu_id",
 )
+
+# ★ 2026-07-27（2026_daily 移植，修掉 §6.2）：以下前綴的欄位**不做 fillna(0)**，
+#   保留 NaN 交給 LightGBM 的原生缺失分支。
+#   理由：0 落在 clu_ 特徵的合法值域內（`clu_rank_ret_1` 實際值域 [0.05, 1.0]、
+#   真正等於 0 的筆數為 0），fillna(0) 等於送進一個乾淨的哨兵值，模型一刀切在
+#   0 附近就能還原「這筆有沒有 clu 資料」。而 §6.4 已查明那個缺失模式本身帶
+#   真實資訊（⟺「這檔是當天臨時擠進流動性前 20%、不屬於 clu 穩定核心的股票」），
+#   於是缺失指示變數與 clu_ 的實際內容被混在同一組欄位裡，importance 無法解讀。
+#   daily 端 07-22 就改了（daily_model/model_config.py 同名常數），research 落後。
+#   ⚠ 只動訓練矩陣的填補；objective/features/*.py 裡的 fillna(0) 是特徵構造的
+#   一部分，語意不同，不在此列。
+_KEEP_NAN_PREFIXES: tuple[str, ...] = ("clu_",)
+
+
+def _fill_missing(X: pd.DataFrame) -> pd.DataFrame:
+    """對 _KEEP_NAN_PREFIXES 以外的欄位做 fillna(0)，clu_ 系列保留 NaN。"""
+    keep_nan = [c for c in X.columns if c.startswith(_KEEP_NAN_PREFIXES)]
+    if not keep_nan:
+        return X.fillna(0)
+    fill_cols = X.columns.difference(keep_nan, sort=False)
+    return pd.concat([X[fill_cols].fillna(0), X[keep_nan]], axis=1)[X.columns]
+
+
 # [2026-07-15] 與 daily_model_0714_fix.py 的 _EXCLUDE_COLS 統一為同一組，
 # 確保 walk-forward 回測與線上 DailyTrainer 用完全相同的訓練特徵集,結果才能互相比較。
 #
@@ -144,6 +174,49 @@ _EXCLUDE_PREFIXES = (
 #
 # 注意：database/experiment/*/ 內既有的 walk-forward 結果是用舊特徵集跑出來的,
 # 跟本次改動後重跑的結果不可直接比較,需要的話重新跑一次 windows 取得新基準。
+
+
+def _daily_ic(
+    y_true:      np.ndarray,
+    y_pred:      np.ndarray,
+    dates:       np.ndarray,
+    min_per_day: int = 30,
+) -> tuple[float, float, int]:
+    """
+    逐日 cross-sectional Spearman IC 的平均值、t 統計量與有效天數。
+
+    ★ 2026-07-27 新增。與 pooled IC（把所有日期混在一起算一次）的差別：
+      pooled 會把「日間變異」算進去，但每日 top-N 選股只用得到「日內排序」。
+      可查證的量級對照（2026_research §5.1，walk-forward test set）：
+      2020_2022 折 pooled 0.1655 vs 逐日 0.0780、2023_2025 折 0.1043 vs 0.0518，
+      整體 pooled 平均約為逐日的 1.6 倍。評估排序品質請用本函式。
+      ⚠ 檔頭另有一句「daily 端曾出現 pooled=+0.063 而逐日=-0.022（符號相反）」，
+        那是 07-27 當下的臨時比對，**沒有留下對應產出**：daily 的
+        database/daily_predict/*/cv_metrics.json 全部是改版前的 pooled 值，
+        區間 -0.043 ~ +0.033，找不到 +0.063 那一筆。方向可信、數字待重現。
+
+    單日有效樣本少於 min_per_day 即略過該日，避免小樣本 IC 噪音灌入平均。
+    """
+    daily = []
+    for d in np.unique(dates):
+        sel = dates == d
+        if sel.sum() < min_per_day:
+            continue
+        ic_d, _ = spearmanr(y_true[sel], y_pred[sel])
+        if not np.isnan(ic_d):
+            daily.append(ic_d)
+
+    if not daily:
+        return float("nan"), float("nan"), 0
+
+    arr  = np.asarray(daily)
+    mean = float(arr.mean())
+    if len(arr) > 1:
+        std   = float(arr.std(ddof=1))
+        tstat = mean / (std / np.sqrt(len(arr))) if std > 0 else float("nan")
+    else:
+        tstat = float("nan")
+    return mean, tstat, len(arr)
 
 
 def load_feature_list(exclude_cols: set[str] | None = None) -> list[str]:
@@ -189,7 +262,7 @@ class WalkForwardConfig:
     # 基底是模組層的 _EXCLUDE_COLS / _EXCLUDE_PREFIXES，下面兩欄是**額外**
     # 疊加的部分（聯集，不是取代）。實際生效清單見 resolved_exclude_cols()。
     #
-    # 典型用途（main_fix_0709.py::RunConfig.EXTRA_EXCLUDE_COLS）：把
+    # 典型用途（objective/research_config.py::RunConfig.EXTRA_EXCLUDE_COLS）：把
     # market_value / close 這類「保留於 CSV、但不可進訓練」的外部條件變數排掉。
     # 排除清單屬於**實驗設定**——換一組就是換一個實驗——所以它該跟其他設定一樣
     # 走 config、被記進 metrics.json 與 run_manifest.json，而不是靠改全域狀態。
@@ -266,7 +339,7 @@ class WalkForwardConfig:
                 "  freeze_hyperparams=True, 預植參數     → tune_mode='frozen'\n"
                 "                                          + trainer.preload_params(p)\n"
                 "  retune_every_n < 999                  → tune_mode='periodic'\n"
-                "（舊寫法的實際行為與字面意思不符，詳見 summary_research.md 5.1）"
+                "（舊寫法的實際行為與字面意思不符，詳見 2026_research/summary_research.md §6.1）"
             )
 
         if self.tune_mode not in self._TUNE_MODES:
@@ -337,7 +410,7 @@ class WalkForwardTrainer:
         windows = self.cfg.windows()
 
         # ★ fail fast：frozen 模式沒預植參數就直接停，不要靜默改跑 Optuna
-        #   （這正是舊 freeze_hyperparams 版本的 bug，見 summary_research.md 5.1）
+        #   （這正是舊 freeze_hyperparams 版本的 bug，見 2026_research/summary_research.md §6.1）
         if self.cfg.tune_mode == "frozen" and self._frozen_params is None:
             raise RuntimeError(
                 "tune_mode='frozen' 但沒有預植超參數。"
@@ -463,9 +536,9 @@ class WalkForwardTrainer:
         feature_cols = self._resolve_features(full_df)
         print(f"  實際使用特徵: {len(feature_cols)} 個")
 
-        X_train = train_df[feature_cols].fillna(0)
+        X_train = _fill_missing(train_df[feature_cols])
         y_train = train_df[self.cfg.target_col]
-        X_test  = test_df[feature_cols].fillna(0)
+        X_test  = _fill_missing(test_df[feature_cols])
         y_test  = test_df[self.cfg.target_col]
 
         # CV 切折依據（傳給 lgb_utils 以唯一交易日為單位切折）
@@ -504,7 +577,8 @@ class WalkForwardTrainer:
         print("  訓練最終模型...")
         model = train_final_lgb(X_train, y_train, best_params, train_weight)
 
-        oof_ic = evaluate_oof_ic(y_train, oof_pred)
+        # ★ 2026-07-27：逐日 IC 平均（舊版 pooled 含日間變異，會系統性高估）
+        oof_ic = evaluate_oof_ic(y_train, oof_pred, dates=train_dates)
 
         metrics, pred_df, imp_df = self._evaluate(
             model, X_test, y_test, feature_cols, test_df
@@ -642,12 +716,26 @@ class WalkForwardTrainer:
 
         ic, _ = spearmanr(y_test, y_pred)
 
+        # ★ 2026-07-27：新增逐日 IC。
+        #   `ic` 是把測試年所有日期混在一起的 pooled Spearman，同時吃到日間變異
+        #   （哪一天大盤好）與日內變異（當天哪檔股票好），但 backtest 只用得到後者。
+        #   實測 pooled 約為逐日平均的 3.6 倍（2024_2026 window：0.162 vs 0.045），
+        #   會系統性高估模型品質。`ic` 保留原定義供既有 11 個 experiment 資料夾
+        #   對照，新增的 `ic_daily` / `ic_daily_t` 才是與選股口徑一致的數字，
+        #   評估模型請看後者。
+        ic_daily, ic_daily_t, n_days = _daily_ic(
+            y_test.values, y_pred, test_df["年月日"].values
+        )
+
         metrics = {
-            "rmse":   round(float(np.sqrt(mean_squared_error(y_test, y_pred))), 6),
-            "mae":    round(float(mean_absolute_error(y_test, y_pred)),         6),
-            "r2":     round(float(r2_score(y_test, y_pred)),                   6),
-            "ic":     round(float(ic),                                        6),
-            "n_test": int(len(y_test)),
+            "rmse":        round(float(np.sqrt(mean_squared_error(y_test, y_pred))), 6),
+            "mae":         round(float(mean_absolute_error(y_test, y_pred)),         6),
+            "r2":          round(float(r2_score(y_test, y_pred)),                   6),
+            "ic":          round(float(ic),                                        6),
+            "ic_daily":    round(float(ic_daily),                                  6),
+            "ic_daily_t":  round(float(ic_daily_t),                                4),
+            "ic_n_days":   int(n_days),
+            "n_test":      int(len(y_test)),
         }
 
         pred_df = test_df[["證券代碼", "年月日", "return"]].copy().reset_index(drop=True)
@@ -682,7 +770,7 @@ class WalkForwardTrainer:
         print(f"\n{'='*60}")
         print(f"  Walk-Forward 完成  →  {out_path}")
         print(f"{'='*60}")
-        cols = ["window", "test_year", "n_test", "ic", "rmse", "mae", "r2",
-                "oof_ic", "hyperparams_tuned"]
+        cols = ["window", "test_year", "n_test", "ic", "ic_daily", "ic_daily_t",
+                "rmse", "mae", "r2", "oof_ic", "hyperparams_tuned"]
         show = [c for c in cols if c in summary_df.columns]
         print(summary_df[show].to_string(index=False))

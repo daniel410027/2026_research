@@ -449,7 +449,12 @@ def train_final_lgb(
     )
 
 
-def evaluate_oof_ic(y_true: pd.Series, oof_pred: np.ndarray) -> float:
+def evaluate_oof_ic(
+    y_true:   pd.Series,
+    oof_pred: np.ndarray,
+    dates:    pd.Series | None = None,
+    min_per_day: int = 30,
+) -> float:
     """
     計算 OOF 預測值與真實值的 Spearman IC（rank correlation），供監控用。
 
@@ -459,22 +464,72 @@ def evaluate_oof_ic(y_true: pd.Series, oof_pred: np.ndarray) -> float:
     不做 threshold 搜尋——regression target 下沒有天然的 0/1 切點，
     改用 IC 監控模型排序品質，實際選股門檻交由呼叫端（如 decile / top-K）決定。
 
+    ─────────────────────────────────────────────
+    ★ 2026-07-27 pooled → 逐日修正
+    ─────────────────────────────────────────────
+      舊版把所有日期混在一起做**一次** spearmanr。該值同時吃到「日間」變異
+      （哪一天大盤好）與「日內」變異（當天哪檔股票好），但下游只用得到後者
+      （每日 top-N 選股）。日間成分會系統性把 IC 灌大，實測同一組 OOF 上
+      pooled=+0.063 而逐日平均=-0.022——**符號都相反**，等於監控失效。
+      ⚠ 上面這組數字是 07-27 當下的臨時比對，**沒有留下對應產出可回查**
+        （daily 的 cv_metrics.json 全是改版前的 pooled 值，區間 -0.043 ~ +0.033，
+        沒有 +0.063 那一筆）。可查證的量級對照見 2026_research §5.1：
+        walk-forward test set 上 pooled 平均約為逐日的 1.6 倍，單折最大
+        0.1655 vs 0.0780。方向可信、該組數字待重現。
+      現改為「逐日各算一次 Spearman 再平均」，與 backtest 的選股口徑一致。
+
+      傳入 `dates` 才會走逐日路徑；未傳時退回 pooled 並印出警告（呼叫端沒有
+      日期資訊時的相容行為，但該值不可信，不要拿來比較模型好壞）。
+
+    Parameters
+    ----------
+    dates       : 與 y_true / oof_pred 逐列對齊的日期序列
+    min_per_day : 單日有效樣本少於此數即略過該日（避免小樣本 IC 噪音）
+
     Returns
     -------
-    float  ── Spearman IC（rank correlation），無有效樣本時回傳 np.nan
+    float  ── 逐日 Spearman IC 的平均（無 dates 時為 pooled），無有效樣本回傳 np.nan
     """
-    y_true   = np.asarray(y_true)
+    y_arr    = np.asarray(y_true)
     oof_pred = np.asarray(oof_pred, dtype=float)
 
-    mask = ~np.isnan(oof_pred)
+    mask    = ~np.isnan(oof_pred)
     n_valid = int(mask.sum())
     if n_valid == 0:
         print("  ⚠ 無有效 OOF 預測值，IC 無法計算")
         return float("nan")
 
-    ic, _ = spearmanr(y_true[mask], oof_pred[mask])
-    print(f"  OOF Spearman IC: {ic:.4f}  (n={n_valid:,})")
-    return float(ic)
+    if dates is None:
+        ic, _ = spearmanr(y_arr[mask], oof_pred[mask])
+        print(f"  ⚠ 未提供 dates，退回 pooled IC: {ic:.4f}  (n={n_valid:,})"
+              f"  ← 含日間變異，會高估，僅供相容")
+        return float(ic)
+
+    d_arr  = np.asarray(dates)[mask]
+    y_ok   = y_arr[mask]
+    p_ok   = oof_pred[mask]
+
+    daily, n_skip = [], 0
+    for d in np.unique(d_arr):
+        sel = d_arr == d
+        if sel.sum() < min_per_day:
+            n_skip += 1
+            continue
+        ic_d, _ = spearmanr(y_ok[sel], p_ok[sel])
+        if not np.isnan(ic_d):
+            daily.append(ic_d)
+
+    if not daily:
+        print(f"  ⚠ 無任何交易日達 min_per_day={min_per_day}，IC 無法計算")
+        return float("nan")
+
+    ic   = float(np.mean(daily))
+    std  = float(np.std(daily, ddof=1)) if len(daily) > 1 else float("nan")
+    tstat = ic / (std / np.sqrt(len(daily))) if std and not np.isnan(std) else float("nan")
+    print(f"  OOF Spearman IC（逐日平均）: {ic:.4f}  "
+          f"std={std:.4f}  t={tstat:+.2f}  days={len(daily):,}  n={n_valid:,}"
+          + (f"  (略過 {n_skip} 個樣本不足日)" if n_skip else ""))
+    return ic
 
 
 def build_imp_df(model: lgb.Booster, feature_cols: list[str]) -> pd.DataFrame:
