@@ -73,7 +73,8 @@ objective/model.py  WalkForwardTrainer     ← 2014–2025，train 2 年 / test 
    │
    ▼
 database/experiment/{start}_{end}/        predictions.csv, metrics.json,
-   │                                      feature_importance.csv, best_params.json
+   │                                      feature_importance.csv, best_params.json,
+   │                                      run_manifest.json（見 3.6）
    ▼
 backtest_0709.py → output/backtest/
 ```
@@ -83,19 +84,40 @@ backtest_0709.py → output/backtest/
 要更新特徵集就去 daily 那邊重跑 `make_new.py` 再搬過來，本 repo 沒有
 `build_macro_external.py` / `make_new.py`。
 
-⚠ 搬新資料過來後，`database_make_liq_filtered/` 的舊快取**不會自動失效**
-（判斷依據只有參數 tag，不看來源檔 mtime）。換過 `database_make/` 就手動砍掉
-對應的 tag 目錄，否則會靜默沿用舊特徵集。
+✅ **快取失效已自動化（2026-07-27）**。以前搬新資料過來後舊快取不會失效，要手動砍
+掉 tag 目錄，忘了就靜默沿用舊特徵集——§5 就是這樣白跑了一輪 42 分鐘。
+
+現在 `build_liquidity_filtered_dir()` 會把來源檔指紋寫進快取目錄的 `_source.json`
+（每年的 size / mtime / **表頭雜湊**＋本次篩選參數），命中前先比對，不符就自動重算。
+表頭雜湊直接抓「欄位集變了」——macro 那次的失敗模式正是整組欄位不存在，而 mtime
+對此毫無資訊。`RunConfig.LIQ_CACHE_STRICT_HASH=True` 可改成雜湊整份檔案內容
+（3.2 GB，每次檢查多花數秒到數十秒），只在「懷疑欄位沒變但值變了」時才需要。
+
+⚠ **沒有 `_source.json` 的舊快取一律視為過期並重算**（刻意的保守選擇：
+「不確定是用哪份來源算的」與「確定是舊的」在研究上是同一件事）。所以改版後第一次
+跑會重建一次快取。若確定現有快取就是對應現在的 `database_make/`，可以手動補一份
+指紋檔跳過重建：
+
+```python
+python -c "
+import json, sys; sys.path.insert(0,'.')
+import main_fix_0709 as m
+cfg = m.RunConfig(); years = list(range(cfg.ML_WINDOW_START, cfg.ML_WINDOW_END+1))
+d = cfg.LIQ_FILTERED_ROOT / m.liq_tag(cfg.LIQ_W1, cfg.LIQ_W2, cfg.LIQ_KEEP_RATIO)
+json.dump(m._source_fingerprint(cfg, years), open(d/'_source.json','w'), ensure_ascii=False, indent=2)
+print('已補指紋:', d)"
+```
 
 ## 3. 關鍵設計決策
 
 ### 3.1 訓練特徵排除
 
-兩層機制，都在 `objective/model.py`：
+兩層機制，基底清單在 `objective/model.py`，實驗要加的部分走 config（見 3.3）：
 
-- `_EXCLUDE_COLS`：精確欄名比對。基底清單在 model.py，`main_fix_0709.py` 的
-  `EXTRA_EXCLUDE_COLS` 會在 `trainer.run()` 前 monkeypatch 進去（`align_features_with_live()`）。
-- `_EXCLUDE_PREFIXES`：前綴比對，目前只有 `"clu_id"`。
+- `_EXCLUDE_COLS`：精確欄名比對。基底 11 欄 + `RunConfig.EXTRA_EXCLUDE_COLS`
+  經 `WalkForwardConfig.extra_exclude_cols` 疊上去，共 15 欄。
+- `_EXCLUDE_PREFIXES`：前綴比對，目前只有 `"clu_id"`（可用
+  `extra_exclude_prefixes` 疊加）。
 
 排除的理由分三類：
 
@@ -121,19 +143,38 @@ train + predict 一起篩——本 repo 是純回測，沒有 daily 那種「既
 全年累積會碰到 780–865 檔（2026-07-22 實測 5 個年份，見 6.4 的表）。
 排名在 20% 切點附近的股票每天進進出出。這對換手成本有直接影響（見 8.9）。
 
-### 3.3 `main_fix_0709.py` 繞過 `objective/__init__.py`（已無必要）
+### 3.3 訓練特徵排除：config 欄位（✅ 2026-07-27 改版）
 
-`main_fix_0709.py` 用 `importlib` 直接載入 `objective/model.py`（`_load_obj_module()`），
-繞過 `__init__.py`。檔頭註解說原因是 `__init__.py` 內有 `from daily_model import ...`
-而 `daily_model` 不在本 repo。
+排除清單走 `WalkForwardConfig`，**不再是模組全域**：
 
-**這個理由已經不成立**——現在的 `objective/__init__.py` 只有相對 import，
-`from objective.model import WalkForwardConfig` 直接跑得動（2026-07-22 實測）。
-繞過機制留著不影響正確性，但新腳本**不需要照抄**，直接 import 即可。
+```python
+from objective.model import WalkForwardConfig, WalkForwardTrainer   # 一般 import 即可
 
-（保留 `_load_obj_module()` 的副作用：它把 `objective.model` 塞進 `sys.modules`，
-所以 `align_features_with_live()` 對 `_EXCLUDE_COLS` 的 monkeypatch 才會作用到
-trainer 實際用的那份模組。改成正常 import 的話這段要一起確認。）
+cfg = WalkForwardConfig(
+    extra_exclude_cols     = {"market_value", "close", ...},   # 疊加在基底之上
+    extra_exclude_prefixes = (),                               # 前綴排除，同樣可疊加
+)
+```
+
+`objective/model.py` 的 `_EXCLUDE_COLS` / `_EXCLUDE_PREFIXES` 降格為**基底預設值**，
+實際生效的是 `cfg.resolved_exclude_cols()` / `resolved_exclude_prefixes()`＝基底 ∪ extra。
+trainer 在建構時就把兩份定下來，`run_manifest.json` 會記錄實際生效的完整清單。
+
+**舊版做法與它的問題**（留著當教訓）：`main_fix_0709.py` 用 `importlib` 繞過
+`__init__.py` 載入 `objective/model.py`，再由 `align_features_with_live()`
+monkeypatch 該模組的 `_EXCLUDE_COLS`。兩件事是綁在一起的——繞過載入是為了保證
+patch 到的模組就是 trainer 用的那份。整條鏈完全隱性：**新入口腳本只要沒照抄整套
+載入順序，排除清單就靜默失效**，而 `market_value` / `close` 一旦進了訓練，
+size/price 交互分析就淪為循環論證，卻不會有任何錯誤訊息。這與 §6.1「宣稱凍結、
+實際照跑 Optuna」是同一類 bug，且因為實驗是整包複製出去的（§0.1），每份副本都
+繼承這個陷阱。
+
+（`align_features_with_live()` 保留為會拋 `RuntimeError` 的遷移 stub，附對照寫法；
+舊副本的程式碼移過來時不會靜默失效。）
+
+⚠ **行為等價**：改版前 `_EXCLUDE_COLS | EXTRA_EXCLUDE_COLS` = 15 欄、前綴
+`("clu_id",)`；改版後 `resolved_exclude_cols()` 同樣是 15 欄、前綴相同（已實測比對）。
+**特徵集沒變，既有 baseline 仍可直接比較。**
 
 ### 3.4 CV 切折以「唯一交易日」為單位
 
@@ -173,6 +214,34 @@ train/valid 兩側 → 同日 cross-sectional 外洩。`lgb_utils._make_cv_folds
 ⚠ **但評估要分開看**：decile 是每日橫斷面排序，日層級成分在選股階段會被完全消掉。
 所以 **pooled IC 會高估選股能力**（它獎勵日均報酬的預測），**daily IC 才是選股的
 誠實指標**。兩個都看，別混用（見 5.1、9.7）。
+
+---
+
+### 3.6 `run_manifest.json`：產出的來源可追溯（🆕 2026-07-27）
+
+每個 `database/experiment/{window}/` 現在多一份 `run_manifest.json`，記錄
+**這份產出是被什麼程式碼、什麼設定跑出來的**：
+
+| 欄位 | 內容 |
+|---|---|
+| `code_hash` / `code.files` | `objective/` 全部 .py 的內容雜湊（整包一個 + 逐檔） |
+| `entry_script` | 入口腳本路徑與雜湊（哪一支 `main_fix_*.py`） |
+| `config` | `WalkForwardConfig` 完整 dump（`tune_mode`、`n_trials`、`extra_exclude_cols`…） |
+| `features` | 實際使用的特徵清單、生效的排除清單與前綴 |
+| `hyperparams` | 本折是否真的有 tune、trial 數、最終參數 |
+| `reproducibility` | **`_PARALLEL_TRIALS` 當時是開還是關**（見 0.2） |
+| `git` / `env` | commit + dirty flag（實驗副本常不是 repo，僅供參考）、套件版本 |
+
+**動機**：§6.1 修完之後留下一句「任何宣稱用固定超參數跑的產出，實際上跑的是
+Optuna」——而當時**沒辦法篩出哪些舊產出受影響**，只能全部作廢。對一個「產出被
+下游實驗當固定上游反覆使用」的 repo，這是架構級缺口。有了 manifest，下次再發現
+某個旗標語意不符，`code_hash` 或 `config.tune_mode` 一比就知道哪些要重跑。
+
+同樣重要的是 `reproducibility`：開著 `_PARALLEL_TRIALS` 跑出來的產出不該被當成
+別的實驗的固定上游，但光看 `predictions.csv` 完全看不出來。
+
+實作 `objective/run_manifest.py`。每個區段各自 try/except——**寫 manifest 絕不可以
+弄掉一次跑了 40 分鐘的訓練**，失敗只印警告。
 
 ## 4. 超參數：已確立的結論
 
@@ -590,6 +659,7 @@ sharpe = (r.mean() * annual_days) / ann_std   # 標準：算術年化 /(σ×√2
 ### 7.1 同步狀態（2026-07-22）
 
 兩邊 `objective/` 是**人工同步的兩份副本**，沒有任何自動檢查，而且已經證明會漏。
+（下表已於 2026-07-27 更新；`min_data_in_leaf` 上界與平行化開關在 07-24 已回推 daily。）
 
 | | 2026_daily | 2026_research |
 |---|---|---|
@@ -600,6 +670,9 @@ sharpe = (r.mean() * annual_days) / ann_std   # 標準：算術年化 /(σ×√2
 | `clu_id*` 前綴排除 | 部分（列舉 `clu_id_daily`） | ✅ 前綴 |
 | `feature_mixin` 拆 `features/` | ✅ | ✅ |
 | regression 改版 | ✅ | ✅ |
+| 流動性公式收進 `objective/liquidity.py` | ✅ 07-27 | ✅ 07-27 |
+| 排除清單走 config（非 monkeypatch） | ✅ 07-27 | ✅ 07-27 |
+| `run_manifest.json` | ✅ 07-27 | ✅ 07-27（僅離線回測路徑） |
 
 其中 `min_data_in_leaf` 上界、平行化開關、`clu_id*` 前綴這三項是 research 領先，
 驗過之後值得回推 daily。**回推時做定點移植，不要整包覆蓋**——兩邊 `_EXCLUDE_COLS`
@@ -658,7 +731,11 @@ daily 的 `FIXED_PARAMS` 是在**舊搜尋空間**下校準的：`learning_rate=
 2. **`market_return` 是真 regime 訊號還是日期指紋**（見 7.2 的實驗設計）——
    同時也解掉兩邊無法比較的問題。順帶檢驗 `sox_zscore20` 純常數項是否必要。
 3. **objective 對拍檢查**——加個 `diff` script 比對本資料夾與 `2026_daily` 的
-   `objective/`，人工同步已經證明會漏。
+   `objective/`，人工同步已經證明會漏。（2026-07-27 前置作業已做：流動性公式從
+   入口腳本收進 `objective/liquidity.py`，否則對拍照不到它——那條公式決定訓練
+   universe，兩端一分歧所有 IC/Sharpe 比較就失去意義。對拍時要帶一份「允許分歧
+   清單」：`model.py` 的 `market_return`（見 7.2）、`preprocess.py` 的 delay1
+   接線位置（架構差異，見 daily summary §8）。）
 4. **`clu_*` 整組排除**（見 6.4）——注意「對齊宇宙」這個舊說法已作廢，宇宙沒有錯位。
 5. **多 seed 驗證 objective 選擇**（見 4.3）——3–5 seed 才能定案 RMSE vs IC。
 6. **OOF IC 已不可用於選擇** 🆕。macro 修復後 `corr(oof_ic, test_ic)` 從 +0.602 掉到

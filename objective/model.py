@@ -37,6 +37,14 @@ Walk-forward LightGBM 訓練模組（FinLab 新專案版）。
     - 將「排除非訓練欄」收回本模組，與 daily_model.py 用同一訓練特徵集。
     - 此檔在 2026_daily 與 2026_research 兩 repo 通用（內容相同即可同步）。
 
+    [2026-07-27 改版] 訓練特徵排除清單改由 config 傳入：
+    - WalkForwardConfig 新增 extra_exclude_cols / extra_exclude_prefixes，
+      模組層的 _EXCLUDE_COLS / _EXCLUDE_PREFIXES 降格為「基底預設值」。
+    - 取代舊的 main_fix_0709.py::align_features_with_live() monkeypatch
+      （它改的是模組全域，因此入口腳本被迫用 importlib 控制載入順序）。
+    - 每個 window 另存 run_manifest.json（程式碼指紋 + 完整 config + 環境），
+      讓「這份產出是什麼跑出來的」可事後查核，見 run_manifest.py 檔頭。
+
 Walk-forward 規則：
     Windows: (2014,2016), (2015,2017), ..., (2022,2024)
     每個 window：
@@ -56,7 +64,7 @@ from __future__ import annotations
 
 import json
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import lightgbm as lgb
@@ -68,6 +76,7 @@ from scipy.stats import spearmanr
 from .lgb_utils import (
     tune_lgb, train_final_lgb, evaluate_oof_ic, build_imp_df, collect_oof_prob,
 )
+from .run_manifest import write_run_manifest
 
 # preprocess 僅在 inject_cache 路徑使用，lazy import 避免 __init__.py 問題
 def _lazy_preprocessor():
@@ -86,6 +95,18 @@ _FEATURES_CSV_PATH = Path("database/features_only.csv")
 _NEW_FEATURES = ["beta", "vol20", "daily_return",
                  "CAPM_Beta一月", "CAPM_Beta九月", "CAPM_Beta一年"]
 
+# ★ 2026-07-27：以下兩個模組層常數是**基底清單（預設值）**，不再是「跑的時候
+#   實際生效的那一份」。實際生效的是 WalkForwardConfig.resolved_exclude_cols() /
+#   resolved_exclude_prefixes()＝基底 ∪ config 的 extra_*。
+#
+#   改動原因：舊版由 main_fix_0709.py 的 align_features_with_live() 直接
+#   monkeypatch 這個模組全域（`_wf_model._EXCLUDE_COLS = before | extra`），而那
+#   又要求入口腳本用 importlib 把 objective.model 塞進 sys.modules，才能保證
+#   patch 到 trainer 真正用的那份模組。整條鏈是隱性的：新入口腳本只要沒照抄
+#   那套載入順序，排除清單就靜默失效——和 §6.1「宣稱凍結、實際照跑 Optuna」
+#   同一類 bug，而且因為實驗是整包複製出去的（§0.1），每份副本都繼承這個陷阱。
+#   改成 config 欄位後，排除清單跟著 config 走、會進 metrics/run_manifest，
+#   入口腳本用一般 import 即可。
 _EXCLUDE_COLS = {
     "證券代碼", "年月日",
     "return", "return_tick", "return_tick_0",
@@ -125,17 +146,22 @@ _EXCLUDE_PREFIXES = (
 # 跟本次改動後重跑的結果不可直接比較,需要的話重新跑一次 windows 取得新基準。
 
 
-def load_feature_list() -> list[str]:
-    """讀取 features_only.csv，附加新特徵，回傳最終候選清單。"""
+def load_feature_list(exclude_cols: set[str] | None = None) -> list[str]:
+    """讀取 features_only.csv，附加新特徵，回傳最終候選清單。
+
+    exclude_cols 未給時退回基底 `_EXCLUDE_COLS`；由 trainer 呼叫時會傳入
+    config 解析後的完整清單（含 extra_exclude_cols）。
+    """
     if not _FEATURES_CSV_PATH.exists():
         raise FileNotFoundError(f"找不到特徵清單: {_FEATURES_CSV_PATH}")
 
+    excl   = _EXCLUDE_COLS if exclude_cols is None else exclude_cols
     raw    = pd.read_csv(_FEATURES_CSV_PATH)["feature"].tolist()
     mapped = raw + _NEW_FEATURES
 
     seen, final = set(), []
     for f in mapped:
-        if f not in seen and f not in _EXCLUDE_COLS:
+        if f not in seen and f not in excl:
             seen.add(f)
             final.append(f)
     return final
@@ -158,6 +184,17 @@ class WalkForwardConfig:
 
     # ── 特徵設定 ──────────────────────────────────────────────
     use_features_csv: bool = False
+
+    # ── ★ 訓練特徵排除（2026-07-27：由 monkeypatch 改為 config）───────
+    # 基底是模組層的 _EXCLUDE_COLS / _EXCLUDE_PREFIXES，下面兩欄是**額外**
+    # 疊加的部分（聯集，不是取代）。實際生效清單見 resolved_exclude_cols()。
+    #
+    # 典型用途（main_fix_0709.py::RunConfig.EXTRA_EXCLUDE_COLS）：把
+    # market_value / close 這類「保留於 CSV、但不可進訓練」的外部條件變數排掉。
+    # 排除清單屬於**實驗設定**——換一組就是換一個實驗——所以它該跟其他設定一樣
+    # 走 config、被記進 metrics.json 與 run_manifest.json，而不是靠改全域狀態。
+    extra_exclude_cols:     frozenset[str] = frozenset()
+    extra_exclude_prefixes: tuple[str, ...] = ()
 
     # ── Optuna / CV ───────────────────────────────────────────
     n_trials:     int = 15
@@ -216,6 +253,11 @@ class WalkForwardConfig:
         self.db_dir          = Path(self.db_dir)
         self.precomputed_dir = Path(self.precomputed_dir)
 
+        # 允許傳 set / list，正規化成 hashable 且不可變的形式（config 會被
+        # dump 進 run_manifest，可變預設值在 dataclass 也是常見地雷）
+        self.extra_exclude_cols     = frozenset(self.extra_exclude_cols)
+        self.extra_exclude_prefixes = tuple(self.extra_exclude_prefixes)
+
         if self.freeze_hyperparams is not None:
             raise ValueError(
                 "freeze_hyperparams 已於 2026-07-22 移除，請改用 tune_mode：\n"
@@ -237,6 +279,15 @@ class WalkForwardConfig:
     def windows(self) -> list[tuple[int, int]]:
         return [(s, s + 2) for s in range(self.window_start, self.window_end - 1)]
 
+    # ── ★ 訓練特徵排除：實際生效清單 ─────────────────────────
+    def resolved_exclude_cols(self) -> frozenset[str]:
+        """基底 `_EXCLUDE_COLS` ∪ `extra_exclude_cols`。"""
+        return frozenset(_EXCLUDE_COLS) | self.extra_exclude_cols
+
+    def resolved_exclude_prefixes(self) -> tuple[str, ...]:
+        """基底 `_EXCLUDE_PREFIXES` ∪ `extra_exclude_prefixes`（去重、排序穩定）。"""
+        return tuple(dict.fromkeys(_EXCLUDE_PREFIXES + self.extra_exclude_prefixes))
+
 
 # ─────────────────────────────────────────────────────────────
 #  TRAINER
@@ -246,8 +297,19 @@ class WalkForwardTrainer:
 
     def __init__(self, config: WalkForwardConfig):
         self.cfg = config
+
+        # ★ 2026-07-27：排除清單在建構時就固定下來（來源是 config，不再是可被
+        #   外部 monkeypatch 的模組全域），之後 _resolve_features 只讀這兩份。
+        self._exclude_cols     = config.resolved_exclude_cols()
+        self._exclude_prefixes = config.resolved_exclude_prefixes()
+        if config.extra_exclude_cols or config.extra_exclude_prefixes:
+            print(f"  訓練排除: 基底 {len(_EXCLUDE_COLS)} 欄 + 額外 "
+                  f"{sorted(config.extra_exclude_cols)}"
+                  + (f" + 額外前綴 {list(config.extra_exclude_prefixes)}"
+                     if config.extra_exclude_prefixes else ""))
+
         if config.use_features_csv:
-            self.feature_list = load_feature_list()
+            self.feature_list = load_feature_list(self._exclude_cols)
             print(f"  特徵模式: features_only.csv  ({len(self.feature_list)} 個候選)")
         else:
             self.feature_list = None
@@ -457,19 +519,44 @@ class WalkForwardTrainer:
             "return_weight_used": self.cfg.use_return_weight,
             "hyperparams_tuned":  do_tune,   # 本 fold 是否重新 tune
             "tune_mode":          self.cfg.tune_mode,
+            "n_features":         len(feature_cols),
         })
 
         out_dir = self.cfg.output_dir / f"{start}_{end}"
         out_dir.mkdir(parents=True, exist_ok=True)
         self._save_outputs(out_dir, metrics, best_params, pred_df, imp_df)
 
+        # ★ 2026-07-27：記錄「這份產出是被什麼程式碼、什麼設定跑出來的」。
+        #   見 objective/run_manifest.py 檔頭的動機說明。
+        write_run_manifest(
+            out_dir,
+            config = asdict(self.cfg),
+            extra  = {
+                "window":         f"{start}_{end}",
+                "fold_index":     fold_index,
+                "train_years":    train_years,
+                "test_year":      test_year,
+                "features": {
+                    "n_used":            len(feature_cols),
+                    "exclude_cols":      sorted(self._exclude_cols),
+                    "exclude_prefixes":  list(self._exclude_prefixes),
+                    "used":              feature_cols,
+                },
+                "hyperparams": {
+                    "tuned_this_fold": do_tune,
+                    "n_trials":        self.cfg.n_trials if do_tune else 0,
+                    "params":          best_params,
+                },
+            },
+        )
+
         print(f"  Test IC={metrics['ic']:.4f}  RMSE={metrics['rmse']:.6f}  → {out_dir}")
         return metrics
 
     def _resolve_features(self, df: pd.DataFrame) -> list[str]:
         available = {
-            c for c in set(df.columns) - _EXCLUDE_COLS
-            if not c.startswith(_EXCLUDE_PREFIXES)
+            c for c in set(df.columns) - self._exclude_cols
+            if not c.startswith(self._exclude_prefixes)
         }
         if not self.cfg.use_features_csv:
             return [

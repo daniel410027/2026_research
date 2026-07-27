@@ -35,20 +35,25 @@ Walk-Forward Pipeline 入口（靜態研究版）。
     2. 否則讀 RunConfig.BEST_PARAMS_PATH（預設 best_params.json）
 
 ─────────────────────────────────────────────
-  ★ 2026-06-15（1）：繞過 objective/__init__.py
+  ★ 2026-07-27：拆掉 importlib 載入 + monkeypatch（原 2026-06-15 兩節）
 ─────────────────────────────────────────────
-  本實驗空間（2026_research）的 objective/__init__.py 內有
-      from daily_model import DailyConfig, DailyTrainer
-  而 daily_model.py 屬於另一個（live）專案、不在此 repo →
-  任何正常 import objective 套件都會先執行 __init__.py 而觸發 ModuleNotFoundError。
-  改以 importlib 直接載入 objective.model，繞過 __init__.py。
+  舊版做兩件互相綁死的事：
+    (1) 用 importlib 直接載入 objective/model.py、繞過 objective/__init__.py
+        （當年的理由是 __init__.py 內有 `from daily_model import ...`，
+         而 daily_model 屬於 live 專案、不在本 repo）；
+    (2) 在 trainer.run() 前 monkeypatch `objective.model._EXCLUDE_COLS`，
+        把 amount / market_value / close 等欄排除於訓練之外。
+  (2) 需要 (1) 保證「patch 到的模組就是 trainer 用的那份」，兩者是一組的。
 
-─────────────────────────────────────────────
-  ★ 2026-06-15（2）：對齊 live(daily) pipeline 訓練特徵集
-─────────────────────────────────────────────
-  daily_model.py 的 _EXCLUDE_COLS 將 amount（成交金額，僅流動性過濾用）排除於
-  訓練之外；static 端的 model._resolve_features 會把所有數值欄當特徵 →
-  於 run_ml() 啟動 trainer 前擴充 objective.model._EXCLUDE_COLS（不改 model.py）。
+  現在 (1) 的理由已不成立（__init__.py 只剩相對 import），而 (2) 本身是隱性的
+  全域狀態改動：新入口腳本只要沒照抄整套載入順序，排除清單就靜默失效——與
+  §6.1「宣稱凍結、實際照跑 Optuna」同一類 bug，且因為實驗是整包複製出去的
+  （§0.1），每份副本都會繼承這個陷阱。
+
+  改法：排除清單變成 WalkForwardConfig.extra_exclude_cols /
+  extra_exclude_prefixes（見 objective/model.py），本檔改用一般 import。
+  新寫實驗入口腳本時直接 `from objective.model import ...` 即可，不需要
+  任何載入順序的儀式。
 
 ─────────────────────────────────────────────
   ★ 2026-06-23：新增 size/price 外部條件變數排除
@@ -83,48 +88,20 @@ Walk-Forward Pipeline 入口（靜態研究版）。
 
 from __future__ import annotations
 
-import importlib.util
+import hashlib
 import json
-import os
 import sys
 import time
-import types
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
+# ★ 2026-07-27：一般 import（原本繞過 __init__.py 的 importlib 機制已移除，
+#   理由見檔頭）。本檔所在目錄即 repo 根目錄，直接執行時 sys.path 已包含它。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# ============================================================
-#  載入 objective 套件（繞過 __init__.py）
-# ============================================================
-
-_ROOT = os.path.dirname(os.path.abspath(__file__))
-_OBJ  = os.path.join(_ROOT, "objective")
-
-if "objective" not in sys.modules:
-    _pkg             = types.ModuleType("objective")
-    _pkg.__path__    = [_OBJ]
-    _pkg.__package__ = "objective"
-    sys.modules["objective"] = _pkg
-
-
-def _load_obj_module(name: str) -> types.ModuleType:
-    """以 importlib 載入 objective/{name}.py，繞過 objective/__init__.py。"""
-    full = f"objective.{name}"
-    if full in sys.modules:
-        return sys.modules[full]
-    spec            = importlib.util.spec_from_file_location(full, os.path.join(_OBJ, f"{name}.py"))
-    mod             = importlib.util.module_from_spec(spec)
-    mod.__package__ = "objective"
-    sys.modules[full] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_wf_model          = _load_obj_module("model")   # ★ 模組本體，供擴充 _EXCLUDE_COLS
-WalkForwardConfig  = _wf_model.WalkForwardConfig
-WalkForwardTrainer = _wf_model.WalkForwardTrainer
+from objective.liquidity import compute_liquidity_mask, liq_tag   # noqa: E402
+from objective.model     import WalkForwardConfig, WalkForwardTrainer  # noqa: E402
 
 
 # ============================================================
@@ -212,6 +189,12 @@ class RunConfig:
     # 篩選後資料快取目錄（依參數 tag 命名，非時間戳；同 tag 已存在則重用，
     # 避免每次重跑都重算，也避免殘留舊目錄造成混淆——805_group2 bug #5 教訓）
     LIQ_FILTERED_ROOT = Path("database_make_liq_filtered")
+    # ★ 2026-07-27：快取驗證嚴格度。False（預設）＝只比對來源檔的
+    #   (size, mtime, 表頭雜湊)，讀一行、幾乎不花時間，足以抓到「換過資料」
+    #   與「欄位集變了」這兩種真正咬人的情況。
+    #   True ＝雜湊整份檔案內容（database_make/ 約 3.2 GB，每次檢查多花數秒到
+    #   數十秒磁碟讀取）。只在「懷疑欄位沒變但值變了」時才需要開。
+    LIQ_CACHE_STRICT_HASH: bool = False
 
     # ── ★ Return-Magnitude Sample Weighting（rank-based，預設關閉）────
     # 開啟後訓練時報酬（LABEL）越高權重越大；若同時開 vol weight 則相乘正規化。
@@ -258,81 +241,121 @@ def load_precomputed(cfg: RunConfig) -> pd.DataFrame:
 # ============================================================
 #  ★ 流動性篩選（805_group2 formula3_amount_mv_turnover）
 # ============================================================
-
-def compute_liquidity_mask(
-    df:         pd.DataFrame,
-    w1:         float,
-    w2:         float,
-    keep_ratio: float,
-    date_col:   str = "年月日",
-) -> pd.Series:
-    """
-    formula3_amount_mv_turnover 流動性篩選（與 daily_fix_hyperparameter_model.py
-    同一公式，維持兩端一致；此處為研究支線獨立副本，非共用 import）。
-
-    score = w1·Z(ln(amount)) + w2·Z(ln(market_value))
-            + (1-w1-w2)·Z(ln(amount/market_value))
-
-    - Z(·) 為每日 cross-sectional z-score
-    - 每日依 score 由大到小排名，保留前 keep_ratio 比例
-    - amount / market_value 缺失、<=0、或當日 std=0（如僅 1 檔）
-      → score = NaN → 明確不合格（不得意外通過篩選）
-
-    Returns
-    -------
-    pd.Series[bool]，index 與 df 對齊；True = 通過篩選。
-    """
-    for col in ("amount", "market_value"):
-        if col not in df.columns:
-            raise KeyError(
-                f"流動性篩選需要 '{col}' 欄，但 database_make/ 資料中找不到。"
-                f"請確認 make_new.py 有保留該欄。"
-            )
-
-    amt = pd.to_numeric(df["amount"],       errors="coerce").where(lambda s: s > 0)
-    mv  = pd.to_numeric(df["market_value"], errors="coerce").where(lambda s: s > 0)
-
-    ln_amt = np.log(amt)
-    ln_mv  = np.log(mv)
-    ln_to  = np.log(amt / mv)          # turnover = amount / market_value
-
-    grp = df[date_col]
-
-    def _z(s: pd.Series) -> pd.Series:
-        g   = s.groupby(grp)
-        std = g.transform("std")
-        return (s - g.transform("mean")) / std.where(std > 0)
-
-    w3    = 1.0 - w1 - w2
-    score = w1 * _z(ln_amt) + w2 * _z(ln_mv) + w3 * _z(ln_to)
-
-    rank_pct = score.groupby(grp).rank(ascending=False, pct=True, method="first")
-    mask     = score.notna() & (rank_pct <= keep_ratio)
-    return mask
+#  ★ 2026-07-27：compute_liquidity_mask / liq_tag 已移到 objective/liquidity.py，
+#    與 2026_daily 共用同一份（原本 daily 在 daily_model/liquidity.py、research
+#    內嵌在本檔，是兩份各自維護的副本，且躲在入口腳本裡連 objective/ 的對拍
+#    檢查都照不到）。公式改動請改那一支，兩個 repo 一起更新。
+# ============================================================
 
 
-def liq_tag(w1: float, w2: float, keep_ratio: float) -> str:
-    """篩選參數 → tag 字串（與 805_group2 summary 命名慣例一致）。
-    e.g. w1=0.1004, w2=0.1896, kr=0.2000 → 'f3_w101004_w201896_kr02000'
-    """
-    def _fmt(x: float) -> str:
-        return f"{x:.4f}".replace("0.", "").zfill(5)
-    return f"f3_w1{_fmt(w1)}_w2{_fmt(w2)}_kr{_fmt(keep_ratio)}"
+# ─────────────────────────────────────────────────────────────
+#  ★ 快取來源指紋（2026-07-27）
+# ─────────────────────────────────────────────────────────────
+#  問題（summary_research.md §2 / §5）：快取目錄只以參數 tag 命名，換過
+#  database_make/（例如從 2026_daily 搬新特徵集過來）之後，舊快取不會失效，
+#  會靜默沿用舊特徵訓練。這件事已經害過一次白跑 42 分鐘。
+#
+#  舊版只比 mtime，擋得住「原地覆蓋」，但擋不住 `cp -p` / rsync 保留時間戳、
+#  或從備份還原（mtime 反而更舊）的情況。而真正咬人的失敗模式是**欄位集變了**
+#  （macro 那次就是整組欄位不存在），mtime 對此毫無資訊。
+#
+#  改為記錄來源檔指紋到快取目錄的 _source.json：每年 (size, mtime_ns, 表頭雜湊)。
+#  表頭雜湊直接抓到欄位集變動——讀一行就好，幾乎不花時間。
+#  需要更嚴格時開 RunConfig.LIQ_CACHE_STRICT_HASH（改雜湊整份檔案內容；
+#  database_make/ 約 3.2 GB，每次檢查多花數秒到數十秒的磁碟讀取）。
+# ─────────────────────────────────────────────────────────────
+
+_SOURCE_FP_FILE = "_source.json"
+
+
+def _file_fingerprint(path: Path, strict: bool) -> dict:
+    """單一來源 CSV 的指紋。strict=True 才雜湊整份檔案內容。"""
+    st = path.stat()
+    fp = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+    with open(path, "rb") as f:
+        if strict:
+            h = hashlib.sha256()
+            for chunk in iter(lambda: f.read(1 << 22), b""):
+                h.update(chunk)
+            fp["content_sha256"] = h.hexdigest()[:16]
+        else:
+            # 只讀表頭那一行：欄位集變了就一定變（macro 欄位整組消失那次的
+            # 失敗模式），而讀一行不需要碰整份 200 MB+ 的檔案。
+            fp["header_sha256"] = hashlib.sha256(f.readline()).hexdigest()[:16]
+    return fp
+
+
+def _source_fingerprint(cfg: "RunConfig", years: list[int]) -> dict:
+    """database_make/ 各年來源檔的指紋 + 本次篩選參數。"""
+    return {
+        "strict_hash": bool(cfg.LIQ_CACHE_STRICT_HASH),
+        "source_dir":  str(cfg.PRECOMPUTED_DIR),
+        "params": {
+            "w1": cfg.LIQ_W1, "w2": cfg.LIQ_W2, "keep_ratio": cfg.LIQ_KEEP_RATIO,
+        },
+        "years": {
+            str(y): _file_fingerprint(cfg.PRECOMPUTED_DIR / f"{y}.csv",
+                                      cfg.LIQ_CACHE_STRICT_HASH)
+            for y in years
+            if (cfg.PRECOMPUTED_DIR / f"{y}.csv").exists()
+        },
+    }
 
 
 def _liq_cache_stale_reason(cfg: "RunConfig", out_dir: Path, years: list[int]) -> str | None:
     """
-    比對 database_make/ 來源檔與快取檔的修改時間。
-    若任一年份的來源檔比快取檔新（例如重跑過 make_new.py），
-    代表快取內容已經過期、不能再重用 → 回傳過期原因字串；否則回傳 None。
+    快取是否已過期。回傳過期原因字串；None = 可安全重用。
+
+    ⚠ 沒有 _source.json 的舊快取一律視為過期並重算。這是刻意的保守選擇：
+      「不確定是用哪份來源算的」與「確定是舊的」在研究上是同一件事——
+      兩者都不能拿來當可比較的實驗上游。
     """
-    for year in years:
-        src = cfg.PRECOMPUTED_DIR / f"{year}.csv"
-        cached = out_dir / f"{year}.csv"
-        if not src.exists() or not cached.exists():
-            continue
-        if src.stat().st_mtime > cached.stat().st_mtime:
-            return f"{src} 比快取檔 {cached} 新"
+    fp_path = out_dir / _SOURCE_FP_FILE
+    if not fp_path.exists():
+        return f"快取缺少 {_SOURCE_FP_FILE}（2026-07-27 之前產生的舊快取，無法驗證來源）"
+
+    try:
+        with open(fp_path, encoding="utf-8") as f:
+            cached_fp = json.load(f)
+    except Exception as e:                                    # noqa: BLE001
+        return f"{fp_path} 讀取失敗（{type(e).__name__}），視為過期"
+
+    current = _source_fingerprint(cfg, years)
+
+    if cached_fp.get("params") != current["params"]:
+        return f"篩選參數不符（快取 {cached_fp.get('params')} vs 現在 {current['params']}）"
+
+    # 快取是寬鬆模式算的、現在要求嚴格 → 沒有可比的欄位，重算
+    if current["strict_hash"] and not cached_fp.get("strict_hash"):
+        return "快取是非 strict 模式建立的，但本次要求 LIQ_CACHE_STRICT_HASH=True"
+
+    key         = "content_sha256" if current["strict_hash"] else "header_sha256"
+    cached_yrs  = cached_fp.get("years", {})
+    current_yrs = current["years"]
+
+    missing = sorted(set(current_yrs) - set(cached_yrs))
+    if missing:
+        return f"快取未涵蓋來源年份 {missing}"
+
+    mtime_only = []
+    for y, cur in current_yrs.items():
+        old = cached_yrs.get(y, {})
+        if old.get(key) != cur.get(key):
+            return f"{cfg.PRECOMPUTED_DIR}/{y}.csv 的{'內容' if current['strict_hash'] else '欄位表頭'}已變更"
+        if old.get("size") != cur.get("size"):
+            return f"{cfg.PRECOMPUTED_DIR}/{y}.csv 檔案大小已變更（{old.get('size')} → {cur.get('size')}）"
+        if old.get("mtime_ns") != cur.get("mtime_ns"):
+            mtime_only.append(y)
+
+    # 大小與表頭都相同、只有 mtime 變 → 幾乎必然是同一份資料被重新複製過來
+    # （220 MB 的 CSV 要「重生成後大小與表頭完全一致但內容不同」機率極低）。
+    # 這種情況重算沒有意義，但值得提醒：若是刻意換過資料，請開 strict 模式確認。
+    if mtime_only:
+        print(f"  ℹ 來源檔 {mtime_only} 的 mtime 變了，但大小與欄位表頭相同 → "
+              f"視為同一份資料，沿用快取。"
+              f"（若確定換過內容，設 RunConfig.LIQ_CACHE_STRICT_HASH=True 重驗）")
+
     return None
 
 
@@ -343,10 +366,10 @@ def build_liquidity_filtered_dir(cfg: "RunConfig") -> Path:
     輸出成同樣的 per-year CSV 結構到 LIQ_FILTERED_ROOT/{tag}/，
     供 WalkForwardTrainer 直接當作 precomputed_dir 讀取。
 
-    快取：若目錄已存在、涵蓋所需年份、且來源檔（database_make/）未被
-    更新過 → 直接重用，不重算（與 test.py/optimize_turnover_filter.py
-    的 SQLite 續跑精神一致）。若來源檔的修改時間比快取檔新（例如重跑過
-    make_new.py 產生新特徵），則視為過期並自動重算，避免訓練用到舊資料。
+    快取：若目錄已存在、涵蓋所需年份、且來源檔（database_make/）的指紋與
+    建立快取時相同 → 直接重用，不重算。指紋不符（換過資料、欄位集變了、
+    篩選參數不同）或快取沒有指紋檔 → 自動重算，避免靜默沿用舊特徵訓練。
+    見上方 _liq_cache_stale_reason 的說明。
     """
     tag     = liq_tag(cfg.LIQ_W1, cfg.LIQ_W2, cfg.LIQ_KEEP_RATIO)
     out_dir = cfg.LIQ_FILTERED_ROOT / tag
@@ -397,6 +420,11 @@ def build_liquidity_filtered_dir(cfg: "RunConfig") -> Path:
     with open(out_dir / "liquidity_filter_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
+    # ★ 2026-07-27：來源指紋。必須在資料寫完之後才寫，否則中途失敗會留下
+    #   「指紋說是新的、內容其實不完整」的快取——比沒有快取更糟。
+    with open(out_dir / _SOURCE_FP_FILE, "w", encoding="utf-8") as f:
+        json.dump(_source_fingerprint(cfg, years), f, ensure_ascii=False, indent=2)
+
     # ★ 同步複製一份到 database/experiment/（backtest.py 預設 EXPERIMENT_DIR 的
     #   上層），供 backtest.py 自動偵測本次訓練用了哪組篩選參數，避免回測時
     #   誤以為是全市場訓練的結果。
@@ -445,15 +473,33 @@ def load_best_params(cfg: RunConfig) -> dict:
 #  ★ 特徵集對齊（與 live/daily 一致）
 # ============================================================
 
-def align_features_with_live(cfg: RunConfig):
-    """擴充 objective.model._EXCLUDE_COLS，使訓練特徵集與 daily_model.py 一致。"""
-    before = set(_wf_model._EXCLUDE_COLS)
-    _wf_model._EXCLUDE_COLS = before | set(cfg.EXTRA_EXCLUDE_COLS)
-    added = sorted(set(cfg.EXTRA_EXCLUDE_COLS) - before)
-    if added:
-        print(f"  ▸ 對齊 live 特徵集，額外自訓練排除：{added}")
-    else:
-        print("  ▸ live 特徵集已對齊（無新增排除欄）")
+def resolve_extra_exclude_cols(cfg: RunConfig) -> frozenset[str]:
+    """
+    回傳要額外排除的欄位，交給 WalkForwardConfig.extra_exclude_cols。
+
+    ★ 2026-07-27：取代舊的 align_features_with_live() —— 那支直接改
+      `objective.model._EXCLUDE_COLS` 這個模組全域，需要入口腳本用 importlib
+      控制載入順序才保證 patch 到對的模組（見檔頭）。現在排除清單跟著 config
+      走，會一起被記進 run_manifest.json，事後查得到某份產出用的是哪一組。
+    """
+    if not cfg.ALIGN_FEATURES_WITH_LIVE:
+        print("  ▸ ALIGN_FEATURES_WITH_LIVE=False，只用 model.py 的基底排除清單")
+        return frozenset()
+
+    extra = frozenset(cfg.EXTRA_EXCLUDE_COLS)
+    print(f"  ▸ 對齊 live 特徵集，額外自訓練排除 {len(extra)} 欄：{sorted(extra)}")
+    return extra
+
+
+def align_features_with_live(cfg: RunConfig):        # pragma: no cover - 遷移用
+    """★ 已移除（2026-07-27）。舊呼叫端會拿到遷移說明，而不是靜默無效。"""
+    raise RuntimeError(
+        "align_features_with_live() 已於 2026-07-27 移除（它 monkeypatch "
+        "objective.model._EXCLUDE_COLS，需要搭配 importlib 載入順序才生效）。\n"
+        "改法：把排除清單傳進 config —\n"
+        "    WalkForwardConfig(..., extra_exclude_cols=resolve_extra_exclude_cols(cfg))\n"
+        "前綴排除則用 extra_exclude_prefixes=(...)。詳見 summary_research.md §3.3。"
+    )
 
 
 # ============================================================
@@ -474,10 +520,9 @@ def run_ml(cfg: RunConfig):
         print(f"\n► 超參數模式：{cfg.TUNE_MODE}（{cfg.N_TRIALS} trials）— {_desc}")
         best_params = None
 
-    # ── ★ 訓練特徵集對齊（必須在 trainer.run() 之前）──────────
-    if cfg.ALIGN_FEATURES_WITH_LIVE:
-        print("\n► 特徵集對齊（train/serve consistency）")
-        align_features_with_live(cfg)
+    # ── ★ 訓練特徵集對齊（走 config，不再改模組全域）──────────
+    print("\n► 特徵集對齊（train/serve consistency）")
+    extra_exclude_cols = resolve_extra_exclude_cols(cfg)
 
     # ── ★ 流動性篩選（805_group2 formula3）──────────────────
     if cfg.LIQ_FILTER_ENABLED:
@@ -497,6 +542,7 @@ def run_ml(cfg: RunConfig):
         use_return_weight = cfg.USE_RETURN_WEIGHT,
         tune_mode         = cfg.TUNE_MODE,
         retune_every_n    = cfg.RETUNE_EVERY_N,
+        extra_exclude_cols = extra_exclude_cols,
     )
     trainer = WalkForwardTrainer(ml_config)
 
