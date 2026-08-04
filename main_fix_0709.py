@@ -90,6 +90,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -303,6 +304,11 @@ def build_liquidity_filtered_dir(cfg: "RunConfig") -> Path:
         stale_reason = _liq_cache_stale_reason(cfg, out_dir, years)
         if stale_reason is None:
             print(f"  ✓ 快取命中，重用已篩選資料: {out_dir}/（{len(years)} 年）")
+            # ★ 2026-08-04（1107 移植）：快取命中時也要把 meta 複製到本次的
+            #   EXPERIMENT_DIR。原本只有「重算」那條路徑會複製，於是重用快取時
+            #   backtest 會印「可能來自未套用流動性篩選的全市場訓練」——訊息與
+            #   事實相反。跑多組設定時這個誤導會被放大好幾倍。
+            _copy_liq_meta_to_experiment_dir(cfg, out_dir)
             return out_dir
         print(f"  ⚠ 快取已過期（{stale_reason}），重新計算流動性篩選 → {out_dir}/")
     else:
@@ -348,15 +354,23 @@ def build_liquidity_filtered_dir(cfg: "RunConfig") -> Path:
     with open(out_dir / _SOURCE_FP_FILE, "w", encoding="utf-8") as f:
         json.dump(_source_fingerprint(cfg, years), f, ensure_ascii=False, indent=2)
 
-    # ★ 同步複製一份到 database/experiment/（backtest.py 預設 EXPERIMENT_DIR 的
-    #   上層），供 backtest.py 自動偵測本次訓練用了哪組篩選參數，避免回測時
-    #   誤以為是全市場訓練的結果。
-    exp_meta_dir = Path("database/experiment")
-    exp_meta_dir.mkdir(parents=True, exist_ok=True)
-    with open(exp_meta_dir / "liquidity_filter_meta.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+    # ★ 同步複製一份到本次的 EXPERIMENT_DIR，供 backtest.py 自動偵測本次訓練
+    #   用了哪組篩選參數，避免回測時誤以為是全市場訓練的結果。
+    #   （2026-08-04：原本寫死 database/experiment/，副本裡跑多組設定會全部
+    #    指到同一個目錄；改讀 cfg.EXPERIMENT_DIR。）
+    _copy_liq_meta_to_experiment_dir(cfg, out_dir)
 
     return out_dir
+
+
+def _copy_liq_meta_to_experiment_dir(cfg: "RunConfig", filtered_dir: Path) -> None:
+    """把篩選快取裡的 liquidity_filter_meta.json 複製到本次的 EXPERIMENT_DIR。"""
+    src = filtered_dir / "liquidity_filter_meta.json"
+    if not src.exists():
+        return
+    exp_meta_dir = Path(getattr(cfg, "EXPERIMENT_DIR", "database/experiment"))
+    exp_meta_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, exp_meta_dir / "liquidity_filter_meta.json")
 
 
 # ============================================================
@@ -461,11 +475,20 @@ def run_ml(cfg: RunConfig):
         precomputed_dir   = train_precomputed_dir,
         target_col        = cfg.LABEL,
         n_trials          = cfg.N_TRIALS,
-        use_vol_weight    = False,
+        # ★ 2026-08-04：原本寫死 False，改讀 config（現行值仍是 False，行為不變）。
+        #   寫死的設定 = 對拍照不到的設定，這正是 07-27 把流動性公式收進
+        #   objective/liquidity.py 的同一個理由。
+        use_vol_weight    = cfg.USE_VOL_WEIGHT,
         use_return_weight = cfg.USE_RETURN_WEIGHT,
         tune_mode         = cfg.TUNE_MODE,
         retune_every_n    = cfg.RETUNE_EVERY_N,
         extra_exclude_cols = extra_exclude_cols,
+        # ★ 2026-08-04（1107 移植）：訓練視窗長度 / 位移 / 時間衰減 + 分設定輸出
+        train_years_n          = cfg.TRAIN_YEARS_N,
+        train_year_offset      = cfg.TRAIN_YEAR_OFFSET,
+        decay_half_life_months = cfg.DECAY_HALF_LIFE_MONTHS,
+        output_dir             = cfg.EXPERIMENT_DIR,
+        random_state           = cfg.RANDOM_STATE,
     )
     trainer = WalkForwardTrainer(ml_config)
 

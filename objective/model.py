@@ -45,11 +45,25 @@ Walk-forward LightGBM 訓練模組（FinLab 新專案版）。
     - 每個 window 另存 run_manifest.json（程式碼指紋 + 完整 config + 環境），
       讓「這份產出是什麼跑出來的」可事後查核，見 run_manifest.py 檔頭。
 
-Walk-forward 規則：
-    Windows: (2014,2016), (2015,2017), ..., (2022,2024)
+    [2026-08-04 移植自 1107_window_length] 訓練視窗長度可設定：
+    - WalkForwardConfig 新增 train_years_n / train_year_offset /
+      decay_half_life_months，**預設值 (2, 0, None) 即改版前寫死的行為**，
+      換寫法不改結果（tools/regression_check_window.py 對本 repo 既有的
+      2023_2025 折驗證 ic / ic_daily / rmse / n_test 逐位元相同）。
+    - 訓練年一律由 cfg.train_years(test_year) 推導（唯一推導處），windows()
+      只負責決定「哪些年可以當測試年」；window 目錄名仍是
+      f"{訓練首年}_{測試年}"。
+    - train_year_offset > 0 是「樣本數不變、只把資料變舊」的控制組。
+    - decay_half_life_months 給指數時間衰減樣本權重，與 vol/return weight
+      相乘後正規化。⚠ 1107 實測衰減權重**更差**，留著是為了可複現該結論，
+      不是推薦設定（見 summary_research.md §9-#18）。
+
+Walk-forward 規則（由 train_years_n / train_year_offset 決定；
+研究端現行預設 4 年，對齊 2026_daily 線上的 train_years=4）：
+    Windows: (訓練首年, 測試年)，例如 n=4 時 (2014,2018), (2015,2019), ...
     每個 window：
-        train = 前兩年（start_year, start_year+1）
-        test  = 第三年（start_year+2）
+        train = 測試年往前 train_years_n 年
+        test  = 測試年
 
 輸出（每個 window 存至 database/experiment/YYYY_YYYY/）：
     predictions.csv
@@ -252,6 +266,16 @@ class WalkForwardConfig:
     window_start: int = 2014
     window_end:   int = 2025
 
+    # ── ★ 訓練視窗長度（2026-08-04，移植自 1107_window_length）───
+    # 測試年 Y 的訓練年 = [Y-offset-n, ..., Y-offset-1]
+    #   train_years_n      = 訓練年數；None = expanding（從 window_start 起算）
+    #   train_year_offset  = 把訓練視窗整體往前推幾年（0 = 緊貼測試年）
+    # ⚠ 這裡刻意維持 (2, 0)＝改版前寫死的 train=[start, start+1]、test=start+2，
+    #   regression_check_window.py 才有東西可對。**要對齊線上的 4 年是設定層的
+    #   決定**，見 objective/research_config.py::RunConfig.TRAIN_YEARS_N = 4。
+    train_years_n:     int | None = 2
+    train_year_offset: int        = 0
+
     # ── 目標欄位 ──────────────────────────────────────────────
     target_col: str = "excess_return"
 
@@ -297,6 +321,14 @@ class WalkForwardConfig:
     use_vol_weight:  bool  = True
     vol_weight_col:  str   = "vol20"
     vol_weight_clip: float = 0.05
+
+    # ── ★ 指數時間衰減樣本權重（2026-08-04，移植自 1107）──────
+    # None = 關閉（改版前行為）。設為半衰期月數 H 時：
+    #     w_i = 0.5 ** (age_days_i / (H * 30.44))
+    # age_days 以該 fold 訓練集**最後一個交易日**為 0（不是預測日，因為
+    # 訓練集末端與測試年之間沒有資料，用哪一端當基準只差一個常數倍率，
+    # 而權重最後會正規化到 mean=1，常數倍率無影響）。
+    decay_half_life_months: float | None = None
 
     # ── Return-Magnitude Sample Weighting（rank-based，可獨立開關）──
     # 報酬（target_col）越高，訓練時權重越大；與 vol weight 同樣採 rank-based
@@ -349,8 +381,29 @@ class WalkForwardConfig:
         if self.tune_mode == "periodic" and self.retune_every_n < 1:
             raise ValueError(f"retune_every_n 需 >= 1，得到 {self.retune_every_n}")
 
+    def train_years(self, test_year: int) -> list[int]:
+        """測試年 → 訓練年清單（唯一的推導處，所有呼叫端都走這裡）。"""
+        last = test_year - self.train_year_offset - 1        # 訓練視窗最後一年
+        if self.train_years_n is None:                       # expanding
+            first = self.window_start
+        else:
+            first = last - self.train_years_n + 1
+        if first < self.window_start or last < first:
+            return []
+        return list(range(first, last + 1))
+
     def windows(self) -> list[tuple[int, int]]:
-        return [(s, s + 2) for s in range(self.window_start, self.window_end - 1)]
+        """
+        回傳 (訓練首年, 測試年)。第一個元素只用來組 window 目錄名，
+        實際訓練年一律由 train_years(test_year) 決定——offset > 0 時
+        兩者不再相鄰，看目錄名就知道這一輪是哪個設定。
+        """
+        out = []
+        for test_year in range(self.window_start, self.window_end + 1):
+            tr = self.train_years(test_year)
+            if tr:
+                out.append((tr[0], test_year))
+        return out
 
     # ── ★ 訓練特徵排除：實際生效清單 ─────────────────────────
     def resolved_exclude_cols(self) -> frozenset[str]:
@@ -453,8 +506,10 @@ class WalkForwardTrainer:
 
         # 只讀 train_years + test_year（滾動特徵已跨年連續，無需重複讀 start 年）
         # 經 test_year_boundary.py 驗證：vol20 / beta / CAPM_Beta 系列 jump_ratio < 2x
+        # ★ train_year_offset > 0 時訓練年與測試年之間會有缺口，這裡只是把
+        #   各年 CSV 疊起來（特徵已預先算好、不在本函式重算），缺年無妨。
         test_year   = end
-        train_years = [start, start + 1]
+        train_years = self.cfg.train_years(test_year)
         years_to_load = train_years + [test_year]
 
         frames = []
@@ -496,7 +551,7 @@ class WalkForwardTrainer:
 
     def _run_window(self, start: int, end: int, fold_index: int = 1) -> dict:
         test_year   = end
-        train_years = [start, start + 1]
+        train_years = self.cfg.train_years(test_year)
 
         print(f"\n► 前處理 Window {start}–{end}...")
         full_df = self._preprocess_window(start, end)
@@ -591,6 +646,12 @@ class WalkForwardTrainer:
             "vol_weight_used":    self.cfg.use_vol_weight,
             "vol_weight_col":     self.cfg.vol_weight_col if self.cfg.use_vol_weight else None,
             "return_weight_used": self.cfg.use_return_weight,
+            # ★ 1107_window_length：視窗設定也進 metrics，否則一堆 experiment_*
+            #   目錄事後分不出誰是哪個設定跑的（複製資料夾做實驗時尤其容易混）。
+            "train_years_n":      self.cfg.train_years_n,
+            "train_year_offset":  self.cfg.train_year_offset,
+            "decay_half_life_months": self.cfg.decay_half_life_months,
+            "n_train":            len(train_df),
             "hyperparams_tuned":  do_tune,   # 本 fold 是否重新 tune
             "tune_mode":          self.cfg.tune_mode,
             "n_features":         len(feature_cols),
@@ -694,22 +755,49 @@ class WalkForwardTrainer:
         )
         return w
 
-    def _compute_sample_weights(self, train_df: pd.DataFrame) -> np.ndarray | None:
-        """合併 vol weight 與 return weight（各自可獨立開關），相乘後正規化。"""
-        w_vol    = self._compute_vol_weights(train_df)
-        w_return = self._compute_return_weights(train_df)
-
-        if w_vol is None and w_return is None:
+    def _compute_decay_weights(self, train_df: pd.DataFrame) -> np.ndarray | None:
+        """
+        指數時間衰減：越舊的樣本權重越小，半衰期 decay_half_life_months 個月。
+        以訓練集最後一個交易日為 age=0；正規化到 mean=1（所以基準日的選擇
+        只影響常數倍率，不影響相對權重）。
+        """
+        h = self.cfg.decay_half_life_months
+        if h is None:
             return None
-        if w_vol is None:
-            return w_return
-        if w_return is None:
-            return w_vol
+        if h <= 0:
+            raise ValueError(f"decay_half_life_months 必須 > 0，收到 {h}")
 
-        w = w_vol * w_return
+        dates    = pd.to_datetime(train_df["年月日"])
+        age_days = (dates.max() - dates).dt.days.values.astype(float)
+        w = 0.5 ** (age_days / (h * 30.44))
         w = w / w.mean()
         print(
-            f"  Combined weight (vol × return): "
+            f"  Decay weight (half-life {h}m): "
+            f"min={w.min():.3f}  max={w.max():.3f}  std={w.std():.3f}  "
+            f"span={age_days.max():.0f} 天"
+        )
+        return w
+
+    def _compute_sample_weights(self, train_df: pd.DataFrame) -> np.ndarray | None:
+        """合併 vol / return / time-decay 權重（各自可獨立開關），相乘後正規化。"""
+        parts = {
+            "vol":    self._compute_vol_weights(train_df),
+            "return": self._compute_return_weights(train_df),
+            "decay":  self._compute_decay_weights(train_df),
+        }
+        active = {k: v for k, v in parts.items() if v is not None}
+
+        if not active:
+            return None
+        if len(active) == 1:
+            return next(iter(active.values()))
+
+        w = np.ones(len(train_df), dtype=float)
+        for v in active.values():
+            w = w * v
+        w = w / w.mean()
+        print(
+            f"  Combined weight ({' × '.join(active)}): "
             f"min={w.min():.3f}  max={w.max():.3f}  std={w.std():.3f}"
         )
         return w

@@ -46,6 +46,35 @@ class RunConfig:
     ML_WINDOW_START = 2014
     ML_WINDOW_END   = 2025
 
+    # ── ★ 訓練視窗長度（2026-08-04，移植自 1107_window_length）──
+    # 測試年 Y 的訓練年 = [Y-OFFSET-N, ..., Y-OFFSET-1]
+    #   TRAIN_YEARS_N     = 訓練年數；None = expanding（從 ML_WINDOW_START 起）
+    #   TRAIN_YEAR_OFFSET = 訓練視窗整體往前推幾年（0 = 緊貼測試年）
+    #   DECAY_HALF_LIFE_MONTHS = 指數時間衰減樣本權重的半衰期；None = 關閉
+    #
+    # ★★ 2026-08-04：2 → 4，**對齊 2026_daily 線上的 `train_years=4`** ★★
+    #
+    # 2026_daily 已於 08-03（commit 823be5a）把每日排程改成 4 年，依據是
+    # 1107_window_length（L2→L4 逐年 ic_daily +0.0066，噪音帶 ±0.0018）與
+    # 1108_icdecay（「模型跟著死掉的因子走」的八個候選機制裡，只剩「訓練視窗
+    # 太短」這個假說活著）。母體這邊還留在 2 年的話，之後每個複製出去的副本
+    # 都在跟線上不同的視窗上做實驗——這正是 §0.1 說的「這裡的每個瑕疵都會被
+    # 複製到未來所有實驗」。
+    #
+    # ⚠ 連帶後果，兩件事都還沒做：
+    #   1. §5.8 的 baseline（database/experiment/）是 2 年視窗跑的，**與現行
+    #      預設不可直接比較**。要沿用舊數字就顯式設 TRAIN_YEARS_N = 2。
+    #   2. daily 的 FIXED_PARAMS 與本 repo §5.8 的逐折參數都是在 2 年視窗下
+    #      調的。訓練列數約翻倍後，num_leaves / min_data_in_leaf / final_rounds
+    #      這三項容量相關參數可能偏保守（daily model_config.py 自己標註
+    #      「複核完成前屬暫代」）。→ backlog §8-#2。
+    #
+    # ⚠ DECAY_HALF_LIFE_MONTHS 留著是為了可複現 1107 的**負面**結論
+    #   （更短視窗與時間衰減權重全部更差），不是推薦設定，見 §9-#18。
+    TRAIN_YEARS_N:          int | None   = 4
+    TRAIN_YEAR_OFFSET:      int          = 0
+    DECAY_HALF_LIFE_MONTHS: float | None = None
+
     # ── 執行步驟 ─────────────────────────────────────────────
     RUN_ML          = True
 
@@ -126,5 +155,34 @@ class RunConfig:
     # ── ★ Return-Magnitude Sample Weighting（rank-based，預設關閉）────
     # 開啟後訓練時報酬（LABEL）越高權重越大；若同時開 vol weight 則相乘正規化。
     USE_RETURN_WEIGHT: bool = False
+
+    # ── ★ Inverse-Vol Sample Weighting（2026-08-04 新增旋鈕）────
+    # ⚠ **這一項兩邊現在不一致，而且是真落差，不是刻意分歧：**
+    #   daily 線上 `DailyConfig.use_vol_weight = True`（cv_metrics.json 的
+    #   `vol_weight_used` 逐日為 true 可證），research 這邊 main_fix_0709.py
+    #   從以前就寫死 False，連旋鈕都沒有。
+    #   → §5.8 baseline 與線上模型在**樣本權重**上就不同，IC/RMSE 本來就不是
+    #     完全可比。2026-08-04 先把它變成可設定的旋鈕並**維持現行值 False**
+    #     （不偷改 baseline 行為）；要不要對齊成 True 是實驗決策，見 §8 backlog。
+    #
+    # ⚠ 不要跟 USE_RETURN_WEIGHT 搞混——那兩件事的證據強度差很多：
+    #   · use_return_weight（rank(y) 加權，即「標籤的函數」）：daily summary §10.2
+    #     有 154 日配對實驗，開權重逐日 IC −0.0329 vs 關 +0.0651，ΔIC +0.0980
+    #     (t=6.63, p=5.4e-10)，107/154 天關的較高，逐年同向。**結論明確：不要用**，
+    #     兩邊現在都是 False。
+    #   · use_vol_weight（inverse-vol，即「特徵側的穩健性加權」）：daily summary
+    #     §10.6 明列為**待辦**——「尚未做 on/off 對照」，只有 154 日粗測
+    #     （都不開 +0.0651 / 只開 vol +0.0729，vol 略優 +0.0078），沒有配對檢定。
+    #     daily 當初開啟的理由寫的是「對齊 research 預設」，指的是
+    #     objective/model.py::WalkForwardConfig.use_vol_weight 的 dataclass 預設
+    #     （確實是 True），但 research **實際跑的**一直是 main_fix 寫死的 False。
+    #     兩邊 summary 都沒記到這一層，所以這個分歧存在多久沒人知道。
+    USE_VOL_WEIGHT: bool = False
+
+    # ── ★ 產出目錄與亂數種子（2026-08-04，移植自 1107）──────────
+    # 副本裡跑多組設定時要把每組的 predictions 分開放，否則 backtest 會把不同
+    # 設定的 window 混在一起讀（backtest_0709.py 是 glob 整個目錄）。
+    EXPERIMENT_DIR = Path("database/experiment")
+    RANDOM_STATE:   int = 42
 
 
