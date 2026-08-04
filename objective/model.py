@@ -633,10 +633,20 @@ class WalkForwardTrainer:
             if not c.startswith(self._exclude_prefixes)
         }
         if not self.cfg.use_features_csv:
-            return [
+            # ★ 2026-07-31：非數值欄會在這裡被丟掉，以前是**靜默**的。
+            #   後果：排除清單算出來的欄數與實際進 LightGBM 的欄數對不上，而且完全
+            #   沒有線索。實際踩過——`市場別`（object dtype: sii/otc/rotc）排除清單放行、
+            #   這關擋掉，導致「表頭機械計算 79、實跑 78」查了一輪才知道差在哪
+            #   （見 summary_research.md §2）。改為印出來，不改行為。
+            numeric = [
                 c for c in df.columns
                 if c in available and pd.api.types.is_numeric_dtype(df[c])
             ]
+            dropped = [c for c in df.columns if c in available and c not in set(numeric)]
+            if dropped:
+                print(f"  ⚠ 有 {len(dropped)} 個候選特徵因非數值 dtype 被排除："
+                      f"{dropped}（如需納入請先轉成數值編碼）")
+            return numeric
         feature_cols = [f for f in self.feature_list if f in available]
         missing      = [f for f in self.feature_list if f not in available]
         if missing:

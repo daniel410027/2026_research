@@ -18,9 +18,20 @@ check_objective_sync.py
 維持不同」的紀錄，不是「懶得處理」的垃圾桶。白名單命中會印出來（不是靜默略過），
 所以理由過期時看得到。
 
+★ 2026-08-03 新增 `--data`：**對拍程式碼只做完一半，另一半是資料。**
+2026-07-31 這支報「✓ 無真落差」的同時，research 的 `database_make/` 比 daily 少了
+6 個因子欄、多了一個已被取代的 `報酬率1`，落後九天（§7.1 的 ⚠）。特徵工程改動要
+落地到 research，除了同步 `objective/` 還得把 daily 重生後的 `database_make/*.csv`
+搬過來。`--data` 就是把 §7.1 那段 `head -1 | sort | diff` 表頭比對收進工具裡——
+三秒的事，但它會在你不記得的時候救你一次。
+
 用法：
     .venv/bin/python tools/check_objective_sync.py
     .venv/bin/python tools/check_objective_sync.py --daily /path/to/2026_daily
+    .venv/bin/python tools/check_objective_sync.py --data          # 只比資料表頭
+    .venv/bin/python tools/check_objective_sync.py --code --data   # 兩者都比
+
+不給 `--code` / `--data` 時預設只比程式碼（維持既有行為與 exit code 語意）。
 
 exit code：0 = 無真落差（可能有白名單命中）；1 = 有真落差。
 """
@@ -177,17 +188,110 @@ def compare(research_dir: Path, daily_dir: Path) -> int:
     return 0
 
 
+def _header(path: Path) -> list[str]:
+    """讀 CSV 第一行的欄名（等同 `head -1 | tr ',' '\\n'`）。"""
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        line = f.readline()
+    return [c.strip() for c in line.rstrip("\r\n").split(",") if c.strip()]
+
+
+def compare_data(research_dir: Path, daily_dir: Path) -> int:
+    """對拍兩邊 database_make/*.csv 的**表頭**（§7.1 的 head -1 | sort | diff）。
+
+    只比欄名集合，不比欄序、不比列數：欄序對訓練沒有意義（trainer 是照欄名取），
+    列數兩邊本來就不同（research 吃跨期、daily 只到最新交易日）。真正會讓兩邊
+    IC/RMSE 不可比的是**特徵集不同**，那就是表頭差異。
+    """
+    r_files = {p.name for p in research_dir.glob("*.csv")}
+    d_files = {p.name for p in daily_dir.glob("*.csv")}
+
+    real_gaps: list[str] = []
+
+    for name in sorted(r_files - d_files):
+        real_gaps.append(f"[僅 research] {name}")
+    for name in sorted(d_files - r_files):
+        real_gaps.append(f"[僅 daily] {name}")
+
+    checked = 0
+    for name in sorted(r_files & d_files):
+        try:
+            r_cols, d_cols = _header(research_dir / name), _header(daily_dir / name)
+        except OSError as e:
+            real_gaps.append(f"[{name}] 無法讀取：{e}")
+            continue
+        checked += 1
+        only_r = sorted(set(r_cols) - set(d_cols))
+        only_d = sorted(set(d_cols) - set(r_cols))
+        if not only_r and not only_d:
+            continue
+        if only_d:
+            real_gaps.append(
+                f"[{name}] research 少了 {len(only_d)} 欄（daily 有、research 沒有）："
+                f"{', '.join(only_d)}"
+            )
+        if only_r:
+            real_gaps.append(
+                f"[{name}] research 多了 {len(only_r)} 欄（可能是已被取代的舊欄）："
+                f"{', '.join(only_r)}"
+            )
+
+    print("=" * 70)
+    print(f"  database_make/ 表頭對拍")
+    print(f"  research: {research_dir}")
+    print(f"  daily   : {daily_dir}")
+    print("=" * 70)
+
+    if real_gaps:
+        print(f"\n✗ 資料落差 {len(real_gaps)} 項——特徵集不同，"
+              f"兩邊的 IC/RMSE **不能互相比較**：")
+        for g in real_gaps:
+            print(f"    ! {g}")
+        print("\n  ⚠ 修法：daily 端跑 make_new.py 重生 database_make/，"
+              "再把 *.csv 搬到 research（research §7.1）。")
+        return 1
+
+    print(f"\n✓ {checked} 個檔案表頭一致。")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--research", type=Path, default=RESEARCH_ROOT / "objective")
     ap.add_argument("--daily", type=Path, default=DEFAULT_DAILY / "objective")
+    ap.add_argument("--research-data", type=Path,
+                    default=RESEARCH_ROOT / "database_make")
+    ap.add_argument("--daily-data", type=Path,
+                    default=DEFAULT_DAILY / "database_make")
+    ap.add_argument("--code", action="store_true",
+                    help="對拍 objective/ 程式碼（未指定任何旗標時的預設）")
+    ap.add_argument("--data", action="store_true",
+                    help="對拍 database_make/ 的 CSV 表頭")
     args = ap.parse_args()
 
-    for label, d in (("research", args.research), ("daily", args.daily)):
-        if not d.is_dir():
-            print(f"✗ 找不到 {label} 的 objective/：{d}", file=sys.stderr)
-            return 2
-    return compare(args.research.resolve(), args.daily.resolve())
+    # 兩個都沒給 → 維持既有預設行為（只比程式碼）
+    do_code, do_data = args.code, args.data
+    if not do_code and not do_data:
+        do_code = True
+
+    rc = 0
+    if do_code:
+        for label, d in (("research", args.research), ("daily", args.daily)):
+            if not d.is_dir():
+                print(f"✗ 找不到 {label} 的 objective/：{d}", file=sys.stderr)
+                return 2
+        rc |= compare(args.research.resolve(), args.daily.resolve())
+
+    if do_data:
+        if do_code:
+            print()
+        for label, d in (("research", args.research_data),
+                         ("daily", args.daily_data)):
+            if not d.is_dir():
+                print(f"✗ 找不到 {label} 的 database_make/：{d}", file=sys.stderr)
+                return 2
+        rc |= compare_data(args.research_data.resolve(), args.daily_data.resolve())
+
+    return rc
 
 
 if __name__ == "__main__":
