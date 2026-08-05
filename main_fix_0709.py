@@ -88,6 +88,7 @@ Walk-Forward Pipeline 入口（靜態研究版）。
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import shutil
@@ -283,6 +284,122 @@ def _liq_cache_stale_reason(cfg: "RunConfig", out_dir: Path, years: list[int]) -
     return None
 
 
+def _count_data_rows(path: Path) -> int:
+    """CSV 資料列數（不含表頭）。只數換行、不解析欄位，200 MB 檔約數百毫秒。
+
+    ⚠ 前提是欄位值裡沒有換行。本專案的 database_make/ 全是數值與代碼，
+      成立；換成含自由文字的資料就不能這樣數。
+    """
+    n = 0
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 22):
+            n += chunk.count(b"\n")
+    return max(n - 1, 0)
+
+
+def _stale_mask_for_year(cfg: "RunConfig", part: pd.DataFrame, year: int) -> pd.Series:
+    """
+    某一年的行情凍結遮罩，**接上前一年的尾巴**再判定。
+
+    為什麼要接尾巴：凍結判定需要連續 STALE_WINDOW 天。逐年獨立算的話，每年
+    1 月的前 4 個交易日永遠湊不滿視窗 → 跨年那段凍結會漏掉（6806 那種在年中
+    下市的抓得到，12 月下市的就會漏）。讀前一年最後 STALE_WINDOW-1 個交易日
+    當種子即可補上，只讀 4 個欄位、約 1 秒。
+    """
+    from objective.liquidity import find_stale_rows, STALE_CHECK_COLS
+
+    w    = int(getattr(cfg, "STALE_WINDOW", 5))
+    cols = ["證券代碼", "年月日", *STALE_CHECK_COLS]
+    det  = part[[c for c in cols if c in part.columns]].copy()
+    det["_cur"] = True
+
+    prev = cfg.PRECOMPUTED_DIR / f"{year - 1}.csv"
+    if prev.exists() and w > 1:
+        seed = pd.read_csv(prev, usecols=lambda c: c in cols, low_memory=False)
+        seed["年月日"]   = pd.to_datetime(seed["年月日"])
+        seed["證券代碼"] = seed["證券代碼"].astype(str)
+        keep_days = sorted(seed["年月日"].unique())[-(w - 1):]
+        seed = seed[seed["年月日"].isin(keep_days)].copy()
+        seed["_cur"] = False
+        det = pd.concat([seed, det], ignore_index=True)
+    else:
+        det = det.reset_index(drop=True)
+
+    stale = find_stale_rows(det, window=w)
+    return pd.Series(stale[det["_cur"].values].values, index=part.index)
+
+
+def _load_cached_fingerprint(out_dir: Path) -> dict | None:
+    """讀既有快取的來源指紋；不存在或壞掉回 None（呼叫端視為全部過期）。"""
+    fp_path = out_dir / _SOURCE_FP_FILE
+    if not fp_path.exists():
+        return None
+    try:
+        with open(fp_path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:                                    # noqa: BLE001
+        print(f"  ⚠ {fp_path} 讀取失敗（{type(e).__name__}），視為無快取")
+        return None
+
+
+def _stale_years(
+    cfg: "RunConfig",
+    cached_fp: dict | None,
+    current_fp: dict,
+    years: list[int],
+    out_dir: Path,
+) -> tuple[list[int], str | None]:
+    """
+    逐年判斷哪幾年需要重算。
+
+    回傳 (需重算的年份, 整批失效的原因)。整批失效原因不為 None 時，
+    年份清單無意義——那幾種情況（篩選參數變了、strict 模式升級、沒有指紋檔）
+    影響的是每一年，逐年比對沒有意義。
+
+    ⚠ 「沒有指紋檔 → 全部重算」沿用 2026-07-27 的保守選擇：「不確定是用哪份
+      來源算的」與「確定是舊的」在研究上是同一件事，都不能當可比較的上游。
+    """
+    if cached_fp is None:
+        return years, f"快取缺少 {_SOURCE_FP_FILE}（無法驗證來源）"
+    if cached_fp.get("params") != current_fp["params"]:
+        return years, (f"篩選參數不符（快取 {cached_fp.get('params')} "
+                       f"vs 現在 {current_fp['params']}）")
+    if current_fp["strict_hash"] and not cached_fp.get("strict_hash"):
+        return years, "快取是非 strict 模式建立的，但本次要求 LIQ_CACHE_STRICT_HASH=True"
+
+    key        = "content_sha256" if current_fp["strict_hash"] else "header_sha256"
+    cached_yrs = cached_fp.get("years", {})
+    stale, mtime_only = [], []
+
+    for y in years:
+        ys  = str(y)
+        cur = current_fp["years"].get(ys)
+        if cur is None:                       # 來源檔不存在 → 沒得算，跳過
+            continue
+        if not (out_dir / f"{y}.csv").exists():
+            stale.append(y)                   # 指紋在但產出檔不見了
+            continue
+        old = cached_yrs.get(ys)
+        if old is None:
+            stale.append(y)                   # 新增的年份（例如 2026）
+        elif old.get(key) != cur.get(key):
+            print(f"    · {y}: {'內容' if current_fp['strict_hash'] else '欄位表頭'}已變更")
+            stale.append(y)
+        elif old.get("size") != cur.get("size"):
+            print(f"    · {y}: 檔案大小已變更（{old.get('size')} → {cur.get('size')}）")
+            stale.append(y)
+        elif old.get("mtime_ns") != cur.get("mtime_ns"):
+            mtime_only.append(y)
+
+    # 大小與表頭都相同、只有 mtime 變 → 幾乎必然是同一份資料被重新複製過來。
+    if mtime_only:
+        print(f"  ℹ 來源檔 {mtime_only} 的 mtime 變了，但大小與欄位表頭相同 → "
+              f"視為同一份資料，沿用快取。"
+              f"（若確定換過內容，設 RunConfig.LIQ_CACHE_STRICT_HASH=True 重驗）")
+
+    return stale, None
+
+
 def build_liquidity_filtered_dir(cfg: "RunConfig") -> Path:
     """
     對 [ML_WINDOW_START, ML_WINDOW_END] 全範圍資料套用流動性篩選
@@ -296,52 +413,117 @@ def build_liquidity_filtered_dir(cfg: "RunConfig") -> Path:
     見上方 _liq_cache_stale_reason 的說明。
     """
     tag     = liq_tag(cfg.LIQ_W1, cfg.LIQ_W2, cfg.LIQ_KEEP_RATIO)
+    # ★ 2026-08-04：剔除行情凍結列是「宇宙定義的一部分」，必須進 tag。
+    #   否則開關切換時兩種宇宙會共用同一個快取目錄、互相覆蓋，而且事後分不出
+    #   手上這份是哪一種——跟 window 目錄名少了 L4 是同一類錯誤。
+    if getattr(cfg, "EXCLUDE_STALE_QUOTES", False):
+        tag += f"_nz{getattr(cfg, 'STALE_WINDOW', 5)}"
     out_dir = cfg.LIQ_FILTERED_ROOT / tag
     years   = list(range(cfg.ML_WINDOW_START, cfg.ML_WINDOW_END + 1))
 
-    existing = [out_dir / f"{y}.csv" for y in years if (out_dir / f"{y}.csv").exists()]
-    if out_dir.exists() and len(existing) == len(years):
-        stale_reason = _liq_cache_stale_reason(cfg, out_dir, years)
-        if stale_reason is None:
-            print(f"  ✓ 快取命中，重用已篩選資料: {out_dir}/（{len(years)} 年）")
-            # ★ 2026-08-04（1107 移植）：快取命中時也要把 meta 複製到本次的
-            #   EXPERIMENT_DIR。原本只有「重算」那條路徑會複製，於是重用快取時
-            #   backtest 會印「可能來自未套用流動性篩選的全市場訓練」——訊息與
-            #   事實相反。跑多組設定時這個誤導會被放大好幾倍。
-            _copy_liq_meta_to_experiment_dir(cfg, out_dir)
-            return out_dir
-        print(f"  ⚠ 快取已過期（{stale_reason}），重新計算流動性篩選 → {out_dir}/")
+    # ── ★ 2026-08-04：改為**逐年增量**，不再整批重算 ──────────────
+    #
+    # 可以這樣做的前提（先確認過再改的，不是想當然）：
+    #   compute_liquidity_mask 的 z-score 與排名都是 `groupby(年月日)`，
+    #   **逐日橫斷面**。因此第 Y 年的篩選結果只取決於第 Y 年自己的列，
+    #   逐年分開算與整批算的輸出逐位元相同。
+    #   ⚠ 哪天篩選公式改成吃跨日資訊（例如 N 日平均排名、hysteresis——
+    #     backlog §8-#10 正在考慮的方向），這個前提就不成立，這裡要改回整批。
+    #
+    # 舊行為是「只要有一年對不上就全部重算」。加一年 2026 要付 13 年的代價，
+    # 而那 12 年的來源檔根本沒動過。
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cached_fp   = _load_cached_fingerprint(out_dir)
+    current_fp  = _source_fingerprint(cfg, years)
+    stale_years, global_reason = _stale_years(cfg, cached_fp, current_fp, years, out_dir)
+
+    if global_reason is not None:
+        print(f"  ⚠ 快取整批失效（{global_reason}）→ 全部 {len(years)} 年重算")
+    elif not stale_years:
+        print(f"  ✓ 快取命中，重用已篩選資料: {out_dir}/（{len(years)} 年）")
+        # ★ 2026-08-04（1107 移植）：快取命中時也要把 meta 複製到本次的
+        #   EXPERIMENT_DIR。原本只有「重算」那條路徑會複製，於是重用快取時
+        #   backtest 會印「可能來自未套用流動性篩選的全市場訓練」——訊息與
+        #   事實相反。跑多組設定時這個誤導會被放大好幾倍。
+        _copy_liq_meta_to_experiment_dir(cfg, out_dir)
+        return out_dir
     else:
-        print(f"  快取未命中，重新計算流動性篩選 → {out_dir}/")
+        reuse = [y for y in years if y not in stale_years]
+        print(f"  ► 增量更新：重算 {stale_years}，沿用 {len(reuse)} 年既有快取")
+
     print(f"  w1(amount)={cfg.LIQ_W1}  w2(mv)={cfg.LIQ_W2}  "
           f"w3(turnover)={1 - cfg.LIQ_W1 - cfg.LIQ_W2:.4f}  "
           f"keep_ratio={cfg.LIQ_KEEP_RATIO}")
 
-    df = load_precomputed(cfg)   # 讀原始 database_make/（含 amount, market_value）
-    mask = compute_liquidity_mask(df, cfg.LIQ_W1, cfg.LIQ_W2, cfg.LIQ_KEEP_RATIO)
-    n_before = len(df)
-    df = df[mask].copy()
-    n_after = len(df)
+    todo = years if global_reason is not None else stale_years
+    n_before = n_after = 0
+    recomputed_rows: dict[str, dict] = {}
+    for year in todo:
+        src = cfg.PRECOMPUTED_DIR / f"{year}.csv"
+        if not src.exists():
+            print(f"    [skip] {src} 不存在")
+            continue
+        part = pd.read_csv(src, low_memory=False)
+        part["年月日"]   = pd.to_datetime(part["年月日"])
+        part["證券代碼"] = part["證券代碼"].astype(str)
 
-    kept_per_day = df.groupby("年月日").size()
-    print(f"  篩選結果: {n_before:,} → {n_after:,} 列 ({n_after / n_before:.1%})  "
-          f"每日平均保留 {kept_per_day.mean():.0f} 檔")
+        # ★ 2026-08-04：先剔除行情凍結（下市殭屍）列，再算流動性分數。
+        #   順序有意義——殭屍股的 amount 凍結在下市前的水準，留著會佔掉別人的
+        #   前 20% 名額（6806 案例）。
+        if getattr(cfg, "EXCLUDE_STALE_QUOTES", False):
+            n0 = len(part)
+            part = part[~_stale_mask_for_year(cfg, part, year)].copy()
+            if n0 != len(part):
+                print(f"      🧟 {year} 剔除行情凍結列 {n0 - len(part):,}")
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for year, part in df.groupby(df["年月日"].dt.year):
-        part = part.sort_values(["證券代碼", "年月日"])
-        part.to_csv(out_dir / f"{year}.csv", index=False, encoding="utf-8-sig")
-        print(f"    ✓ {out_dir}/{year}.csv  {part.shape}")
+        mask = compute_liquidity_mask(part, cfg.LIQ_W1, cfg.LIQ_W2, cfg.LIQ_KEEP_RATIO)
+        kept = part[mask].sort_values(["證券代碼", "年月日"])
+        n_before += len(part)
+        n_after  += len(kept)
+        recomputed_rows[str(year)] = {"before": len(part), "after": len(kept)}
+        kept.to_csv(out_dir / f"{year}.csv", index=False, encoding="utf-8-sig")
+        print(f"    ✓ {out_dir}/{year}.csv  {kept.shape}  "
+              f"（{len(part):,} → {len(kept):,}，每日平均保留 "
+              f"{kept.groupby('年月日').size().mean():.0f} 檔）")
+
+    if n_before:
+        print(f"  本次重算合計: {n_before:,} → {n_after:,} 列 ({n_after / n_before:.1%})")
+
+    # ★ 增量之後 rows_before/after 不能只算「這次重跑的年份」——那會讓
+    #   liquidity_filter_meta.json 顯示成「整個快取只有一年」。改為逐年記錄，
+    #   沿用的年份從舊 meta 帶過來，總數是各年相加。
+    old_meta  = {}
+    meta_path = out_dir / "liquidity_filter_meta.json"
+    if meta_path.exists():
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                old_meta = json.load(f)
+        except Exception:                                     # noqa: BLE001
+            old_meta = {}
+    rows_by_year = {str(k): v for k, v in (old_meta.get("rows_by_year") or {}).items()}
+    rows_by_year.update(recomputed_rows)
+    # 2026-08-04 之前建立的快取沒有 rows_by_year → 對沿用的年份補算一次
+    # （只數換行不解析 CSV，13 年約數秒；之後就會一直帶著這個欄位）。
+    for y in years:
+        ys = str(y)
+        if ys in rows_by_year:
+            continue
+        src, dst = cfg.PRECOMPUTED_DIR / f"{y}.csv", out_dir / f"{y}.csv"
+        if src.exists() and dst.exists():
+            rows_by_year[ys] = {"before": _count_data_rows(src),
+                                "after":  _count_data_rows(dst)}
+    rows_by_year = {y: rows_by_year[y] for y in sorted(rows_by_year) if int(y) in years}
 
     meta = {
+        "rows_by_year":  rows_by_year,
         "formula":       "formula3_amount_mv_turnover",
         "w1_amount":     cfg.LIQ_W1,
         "w2_market_value": cfg.LIQ_W2,
         "w3_turnover":   round(1 - cfg.LIQ_W1 - cfg.LIQ_W2, 4),
         "keep_ratio":    cfg.LIQ_KEEP_RATIO,
         "tag":           tag,
-        "rows_before":   n_before,
-        "rows_after":    n_after,
+        "rows_before":   sum(v["before"] for v in rows_by_year.values()),
+        "rows_after":    sum(v["after"]  for v in rows_by_year.values()),
         "window_start":  cfg.ML_WINDOW_START,
         "window_end":    cfg.ML_WINDOW_END,
         "source":        "805_group2 summary.md（f3_w101004_w201896_kr01520）",
@@ -515,7 +697,60 @@ def run_ml(cfg: RunConfig):
               f"逐折參數見 {ml_config.output_dir}/{{window}}/best_params.json")
 
 
+def narrow_to_test_year(cfg: RunConfig, test_year: int) -> RunConfig:
+    """
+    把 config 收窄成「只跑這一個測試年」的版本。
+
+    ★ 2026-08-04：原本是獨立的 run_fold_2026.py，用完就刪，改寫成通用的一支。
+      動機：`main_fix_0709.py` 一跑就是整個 walk-forward（9 折約 2 小時），
+      但常常只是想補跑一折——例如資料多了一年、或某一折要換設定重跑。
+      其餘折的產出既然設定相同，重算只是把同樣的數字再算一次。
+
+    做法：把 `ML_WINDOW_START` 抬到「這個測試年需要的最早訓練年」。
+    `train_years(Y) = [Y-off-n, ..., Y-off-1]` 仍完整落在範圍內，而其他測試年
+    的訓練首年都會 < window_start 被 `train_years()` 判為不合法 → `windows()`
+    只剩一折。訓練資料與設定跟整批跑時**完全相同**，不是近似。
+
+    ⚠ expanding（TRAIN_YEARS_N=None）不支援：那個模式下 window_start 決定
+      訓練起點，收窄就等於改了模型，不是只挑一折。
+    """
+    n = cfg.TRAIN_YEARS_N
+    if n is None:
+        raise ValueError(
+            "TRAIN_YEARS_N=None（expanding）時不能只挑一折——window_start "
+            "同時是訓練起點，收窄會改變模型本身。請直接跑完整 walk-forward。"
+        )
+    first_train = test_year - cfg.TRAIN_YEAR_OFFSET - n
+
+    class _Narrowed(cfg.__class__):                 # 保留呼叫端可能有的其他覆寫
+        ML_WINDOW_START = first_train
+        ML_WINDOW_END   = test_year
+
+    return _Narrowed()
+
+
 def main():
+    ap = argparse.ArgumentParser(
+        description="walk-forward 訓練。不給參數 = 跑 RunConfig 設定的完整範圍。")
+    ap.add_argument(
+        "--only-test-year", type=int, nargs="+", metavar="YEAR",
+        help="只跑指定測試年的那幾折（可給多個），其餘沿用既有產出不重算。"
+             "例：--only-test-year 2026")
+    args = ap.parse_args()
+
+    if args.only_test_year:
+        base = RunConfig()
+        total = time.time()
+        for i, y in enumerate(sorted(args.only_test_year), 1):
+            cfg = narrow_to_test_year(base, y)
+            print(f"\n{'='*60}")
+            print(f"  只跑測試年 {y}（{i}/{len(args.only_test_year)}）")
+            print(f"  訓練年     : {list(range(cfg.ML_WINDOW_START, y - base.TRAIN_YEAR_OFFSET))}")
+            print(f"{'='*60}")
+            run_ml(cfg)
+        print(f"\n  總耗時: {time.time() - total:.1f} 秒")
+        return
+
     cfg = RunConfig()
 
     print(f"\n{'='*60}")

@@ -44,7 +44,14 @@ class RunConfig:
 
     # ── Walk-Forward 範圍（2026 不納入）─────────────────────
     ML_WINDOW_START = 2014
-    ML_WINDOW_END   = 2025
+    # ★ 2026-08-04：2025 → 2026，納入今年到目前為止的資料當最後一折。
+    # ⚠ 2026 是**不完整的年份**：database_make/2026.csv 到 2026-07-30，
+    #   有標籤的交易日 135 天（其他年 242–247 天）。後果：
+    #     · `ic_daily_t` 隨 √n 縮，跟其他年並排會被誤讀成「訊號變弱」
+    #     · 年化報酬是把半年用 252 天外推，波動遠大於其他年
+    #   → **2026 那折當「今年到目前為止的進度追蹤」看，不要放進 baseline 的
+    #     逐年比較表。** 要回到只跑完整年，把這裡改回 2025。
+    ML_WINDOW_END   = 2026
 
     # ── ★ 訓練視窗長度（2026-08-04，移植自 1107_window_length）──
     # 測試年 Y 的訓練年 = [Y-OFFSET-N, ..., Y-OFFSET-1]
@@ -151,6 +158,21 @@ class RunConfig:
     #   True ＝雜湊整份檔案內容（database_make/ 約 3.2 GB，每次檢查多花數秒到
     #   數十秒磁碟讀取）。只在「懷疑欄位沒變但值變了」時才需要開。
     LIQ_CACHE_STRICT_HASH: bool = False
+
+    # ── ★ 行情凍結（下市殭屍股）剔除（2026-08-04）──────────────
+    # 同一檔股票連續 STALE_WINDOW 個交易日 close 與 amount 逐字相同 → 視為
+    # 已下市／長期停牌被 ffill，該段列從宇宙中剔除（訓練與測試都剔）。
+    # 詳見 objective/liquidity.py::find_stale_rows 的說明與 6806 案例。
+    #
+    # 實測影響（篩選後宇宙）：2025 年 254 列 / 9 檔（0.50%）、
+    # 2026 年 73 列 / 2 檔（0.25%，含 6806）。列數佔比小，但它們是**恆定報酬
+    # 且必然通過流動性濾網**的樣本，且在測試端會被排進 decile。
+    #
+    # ⚠ 開關會改變訓練宇宙 → 快取目錄名與 window 目錄名都會帶標記
+    #   （`..._nz` 與 `..._L4z`），開關前後的產出不會互相覆蓋，也不會被
+    #   backtest 默默混在一起（見 backtest_0709.py 的混用偵測）。
+    EXCLUDE_STALE_QUOTES: bool = True
+    STALE_WINDOW:        int  = 5
 
     # ── ★ Return-Magnitude Sample Weighting（rank-based，預設關閉）────
     # 開啟後訓練時報酬（LABEL）越高權重越大；若同時開 vol weight 則相乘正規化。

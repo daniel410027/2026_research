@@ -498,6 +498,35 @@ class WalkForwardTrainer:
 
         self._save_summary(all_metrics)
 
+    def window_dir_name(self, start: int, end: int) -> str:
+        """
+        產出資料夾名稱：`{訓練首年}_{測試年}_L{訓練年數}`，例如 `2022_2026_L4`。
+
+        ★ 2026-08-04 加上 `_L{n}` 後綴。原本只有 `{start}_{end}`，在單一視窗
+          長度下沒問題，但視窗長度一改就會出事——實際踩過：`database/experiment/`
+          裡同時躺著 L2 的 `2016_2018` 與 L4 的 `2014_2018`（同一個測試年 2018
+          的兩份預測），而 backtest_0709.py 是 glob 整個目錄再去重，於是
+          **2016–2017 取到 L2 的預測、2018 以後取到 L4 的**，一張圖裡混了兩個
+          模型，還不會報錯。
+
+          加上後綴之後兩者名稱不同、且 backtest 端可以偵測到多種 L 並存而擋下來
+          （見 backtest_0709.py::load_all_predictions）。
+
+        expanding（train_years_n=None）記為 `Lexp`；train_year_offset > 0 時
+        另加 `_off{k}`，否則位移過的視窗會與正常視窗撞名。
+        """
+        n   = self.cfg.train_years_n
+        tag = f"L{n}" if n is not None else "Lexp"
+        if self.cfg.train_year_offset:
+            tag += f"_off{self.cfg.train_year_offset}"
+        # ★ 剔除行情凍結列（下市殭屍股）→ 加 z。這改的是**宇宙**不是超參數，
+        #   開關前後的 IC/Sharpe 不可比，必須從目錄名就看得出來。
+        #   （由 precomputed_dir 的 tag 反推，因為 WalkForwardConfig 本身不帶
+        #     這個設定——它吃的是已經篩好的目錄。）
+        if "_nz" in str(self.cfg.precomputed_dir):
+            tag += "z"
+        return f"{start}_{end}_{tag}"
+
     def _preprocess_window(self, start: int, end: int) -> pd.DataFrame:
         key = (start, end)
         if key in self._df_cache:
@@ -657,7 +686,7 @@ class WalkForwardTrainer:
             "n_features":         len(feature_cols),
         })
 
-        out_dir = self.cfg.output_dir / f"{start}_{end}"
+        out_dir = self.cfg.output_dir / self.window_dir_name(start, end)
         out_dir.mkdir(parents=True, exist_ok=True)
         self._save_outputs(out_dir, metrics, best_params, pred_df, imp_df)
 

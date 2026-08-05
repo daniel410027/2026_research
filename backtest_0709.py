@@ -74,6 +74,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+import matplotlib.colors as mcolors
 import matplotlib.font_manager as fm
 import numpy as np
 import pandas as pd
@@ -167,8 +168,21 @@ MKT_COL  = "market_return_fwd"
 #  工具函式
 # ============================================================
 
+def _window_regime(name: str) -> str:
+    """從 window 目錄名取出「視窗長度標記」：2022_2026_L4 → L4；2016_2018 → L?（舊命名）。"""
+    parts = name.split("_")
+    return parts[2] if len(parts) >= 3 else "L?"
+
+
 def load_all_predictions(exp_dir: Path) -> pd.DataFrame:
-    """讀取所有 window 的 predictions.csv，合併並去重。"""
+    """讀取所有 window 的 predictions.csv，合併並去重。
+
+    ⚠ **2026-08-04 新增混用偵測。** 這個目錄是固定路徑，換設定重跑不會清掉舊
+      產出，於是不同訓練視窗長度的 fold 會並存。實際踩過：L2 的 `2016_2018` 與
+      L4 的 `2014_2018` 同時在，兩者測試年都是 2018，去重只保留一份，結果整份
+      回測**前段是 L2 模型、後段是 L4 模型**——圖照畫、數字照出、沒有任何警告。
+      現在偵測到多種 L 標記就直接中止，要求先清乾淨或指定要用哪一個。
+    """
     frames = []
     for path in sorted(exp_dir.glob("*/predictions.csv")):
         df = pd.read_csv(path, low_memory=False)
@@ -178,6 +192,22 @@ def load_all_predictions(exp_dir: Path) -> pd.DataFrame:
 
     if not frames:
         raise FileNotFoundError(f"{exp_dir} 下找不到任何 predictions.csv")
+
+    regimes: dict[str, list[str]] = {}
+    for f in frames:
+        regimes.setdefault(_window_regime(f["_window"].iloc[0]), []).append(
+            f["_window"].iloc[0])
+    if len(regimes) > 1:
+        detail = "\n".join(f"    {k}: {sorted(v)}" for k, v in sorted(regimes.items()))
+        raise RuntimeError(
+            f"{exp_dir} 下同時存在多種訓練視窗長度的產出，混在一起回測沒有意義：\n"
+            f"{detail}\n"
+            f"  L2 / L4 = 每折訓練 2 年 / 4 年；L? = 2026-08-04 之前的舊命名（無長度資訊）。\n"
+            f"  處理方式：把不要的那批移走或刪掉，只留一種。例如\n"
+            f"      mkdir -p database/experiment_archive_L2\n"
+            f"      mv database/experiment/*_L2 database/experiment_archive_L2/\n"
+            f"  （舊命名那批沒有後綴，得自己認：{sorted(regimes.get('L?', []))}）"
+        )
 
     combined = pd.concat(frames, ignore_index=True)
     combined[DATE_COL] = pd.to_datetime(combined[DATE_COL])
@@ -331,6 +361,9 @@ def daily_returns(
     if n_missing > 0:
         print(f"  [WARN] market_return_fwd 缺少 {n_missing} 天（已設為 NaN，不影響 Decile 計算）")
 
+    # ★ 2026-08-04：等權宇宙對照（不扣成本，理由見 universe_ew_returns docstring）
+    ret["universe_ew"] = universe_ew_returns(df, capital_usage).reindex(ret.index)
+
     # excess return（D1 scaled - market）
     if "D1" in ret.columns:
         ret["excess_D1"] = ret["D1"] - ret["market"]
@@ -397,6 +430,40 @@ def calc_metrics(
 # ============================================================
 
 COLORS = plt.cm.RdYlGn(np.linspace(0.15, 0.85, N_DECILES))
+
+# ── ★ 2026-08-04 新增圖表的配色 ────────────────────────────────
+# 這四個色碼**跑過色盲檢查才用**（Machado 2009 protan/deutan 模擬下的 OKLab ΔE，
+# 門檻 ≥ 8）：
+#   D1 vs 等權宇宙（識別身分，categorical）  ΔE=24.7  ✓
+#   超額報酬正/負（極性，diverging）          ΔE=22.1  ✓
+# 兩組的正常視力 ΔE（33.6 / 31.2）與對白底對比度也都過。
+# ⚠ 不要換成紅綠配——那是色盲讀者最分不出來的一組，而既有的 RdYlGn 十分位色帶
+#   已經有這個問題（那是舊圖，未在本次範圍內處理）。
+C_STRAT = "#2a78d6"   # D1（策略）
+C_UNIV  = "#eb6834"   # 等權宇宙
+C_POS   = "#2a78d6"   # 月超額 > 0（贏大盤）
+C_NEG   = "#d1344a"   # 月超額 < 0（輸大盤）
+C_MID   = "#f0efec"   # diverging 中點（中性灰，不是第三個色相）
+C_REF   = "#6b6a66"   # 中性參考線／格線用；不是 categorical 系列，故不受彩度下限規範
+C_INK   = "#0b0b0b"
+C_INK2  = "#52514e"
+
+
+def universe_ew_returns(df: pd.DataFrame, capital_usage: float = 1.0) -> pd.Series:
+    """
+    等權宇宙的每日報酬＝當日**全部**入選股票的等權平均報酬。
+
+    這是比大盤更嚴格的對照組：大盤是市值加權的全市場，而這條線是「在同一個
+    流動性篩選宇宙裡，完全不選股、每天等權持有所有成分股」的結果。模型的
+    選股能力應該表現為 D1 贏過它，贏不過就代表 decile 排序沒有加值。
+
+    ⚠ 不扣交易成本。它是 benchmark 而非可交易策略：等權宇宙的換手來自成分股
+      進出（見 summary_research.md §3.2 的每日 36–40% 成員換手），與 D1 的
+      換手性質不同，套用同一組 cost_bps 會製造出誤導性的對照。COST_BPS > 0
+      時要對照「成本後」的數字，請看 D1 自己與大盤，不要看這條。
+    """
+    ew = df.groupby(DATE_COL)["return"].mean().sort_index()
+    return ew * capital_usage
 
 
 def plot_cumulative(ret_df: pd.DataFrame, output_dir: Path):
@@ -538,6 +605,228 @@ def plot_annual_decile1(ret_df: pd.DataFrame, output_dir: Path):
     fig.savefig(output_dir / "annual_decile1.png", dpi=150)
     plt.close(fig)
     print("  ✓ annual_decile1.png")
+
+
+def monthly_table(ret_df: pd.DataFrame) -> pd.DataFrame:
+    """每月報酬表：D1 / 大盤 / 超額（皆為當月日報酬複利後的月報酬）。
+
+    超額 = D1月報酬 − 大盤月報酬（兩個月報酬的算術差），不是日超額的複利——
+    後者會混進複利交互項，不是「這個月贏大盤幾趴」的直覺意思。
+    """
+    d1  = ret_df["D1"].dropna()
+    mkt = ret_df["market"].dropna()
+    comp = lambda r: (1 + r).prod() - 1
+    m_d1  = d1.groupby(pd.Grouper(freq="ME")).apply(comp)
+    m_mkt = mkt.groupby(pd.Grouper(freq="ME")).apply(comp)
+    out = pd.DataFrame({"d1": m_d1, "market": m_mkt}).dropna()
+    out["excess"] = out["d1"] - out["market"]
+    out.index.name = "month_end"
+    return out
+
+
+def plot_monthly_vs_market(ret_df: pd.DataFrame, output_dir: Path) -> pd.DataFrame:
+    """每月贏／輸大盤幾趴。
+
+    上panel：逐月超額報酬（diverging bar，藍＝贏、紅＝輸，零軸為基準）
+    下panel：年 × 月 熱圖，格子直接標趴數 → 上面看形狀、下面查數字。
+
+    為什麼不畫「D1 月報酬 vs 大盤月報酬」的並排長條：那是 240 根 bar，
+    誰高誰低要一根一根比。問題本身（「跟大盤相比幾趴」）就是個差值，
+    直接畫差值才是回答問題，不是把兩個數擺在一起讓讀者自己減。
+    """
+    m = monthly_table(ret_df)
+    if m.empty:
+        print("  ⚠ 月報酬表為空，跳過 monthly_vs_market.png")
+        return m
+
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(14, 9), gridspec_kw={"height_ratios": [1.0, 1.25]}
+    )
+
+    # ── 上：逐月超額 bar ────────────────────────────────────
+    x = np.arange(len(m))
+    vals = m["excess"].values
+    ax1.bar(x, vals, width=0.82,
+            color=[C_POS if v >= 0 else C_NEG for v in vals], linewidth=0)
+    ax1.axhline(0, color=C_INK, linewidth=0.9)
+
+    # 年份刻度（每年一月的位置）
+    jan = [i for i, d in enumerate(m.index) if d.month == 1]
+    ax1.set_xticks(jan)
+    ax1.set_xticklabels([m.index[i].year for i in jan], fontsize=9)
+    ax1.set_xlim(-0.8, len(m) - 0.2)
+    # 上下各留白，否則最好／最差那兩個月的標註會撞到標題與 x 軸刻度
+    _lo, _hi = float(vals.min()), float(vals.max())
+    _pad = (_hi - _lo) * 0.12
+    ax1.set_ylim(_lo - _pad, _hi + _pad)
+    ax1.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
+    ax1.grid(axis="y", color=C_REF, alpha=0.18, linewidth=0.7)
+    ax1.set_axisbelow(True)
+    ax1.spines[["top", "right"]].set_visible(False)
+    ax1.spines[["left", "bottom"]].set_color(C_REF)
+
+    win = (vals > 0).sum()
+    ax1.set_title(
+        f"D1 每月超額報酬 vs 大盤　"
+        f"（勝率 {win}/{len(vals)} = {win/len(vals):.0%}　"
+        f"月均 {vals.mean():+.2%}　中位 {np.median(vals):+.2%}）",
+        fontsize=13, color=C_INK, pad=10,
+    )
+    ax1.set_ylabel("超額報酬（月）", fontsize=9, color=C_INK2)
+
+    # 只標最好與最差兩個月——不是每根都標數字
+    for i in (int(np.argmax(vals)), int(np.argmin(vals))):
+        ax1.annotate(f"{m.index[i]:%Y-%m}　{vals[i]:+.1%}",
+                     xy=(x[i], vals[i]),
+                     xytext=(0, 10 if vals[i] >= 0 else -10),
+                     textcoords="offset points", ha="center",
+                     va="bottom" if vals[i] >= 0 else "top",
+                     fontsize=8.5, color=C_INK2)
+
+    # ── 下：年 × 月 熱圖 ────────────────────────────────────
+    piv = (m.assign(y=m.index.year, mo=m.index.month)
+             .pivot(index="y", columns="mo", values="excess")
+             .reindex(columns=range(1, 13)))
+
+    # diverging：兩個色相 + 中性灰中點，對稱刻度（絕對值 95 分位，避免單一極端月洗白全圖）
+    cmap = mcolors.LinearSegmentedColormap.from_list("excess_div", [C_NEG, C_MID, C_POS])
+    lim = float(np.nanpercentile(np.abs(piv.values), 95)) or 0.01
+    norm = mcolors.TwoSlopeNorm(vmin=-lim, vcenter=0.0, vmax=lim)
+
+    im = ax2.imshow(piv.values, cmap=cmap, norm=norm, aspect="auto")
+    ax2.set_xticks(range(12))
+    ax2.set_xticklabels([f"{i}月" for i in range(1, 13)], fontsize=9)
+    ax2.set_yticks(range(len(piv.index)))
+    ax2.set_yticklabels(piv.index, fontsize=9)
+    ax2.set_xticks(np.arange(-0.5, 12, 1), minor=True)
+    ax2.set_yticks(np.arange(-0.5, len(piv.index), 1), minor=True)
+    ax2.grid(which="minor", color="white", linewidth=2)   # 格子之間的 2px 間隙
+    ax2.tick_params(which="minor", length=0)
+    ax2.tick_params(colors=C_INK2)
+    for s in ax2.spines.values():
+        s.set_visible(False)
+
+    for r in range(piv.shape[0]):
+        for c in range(piv.shape[1]):
+            v = piv.values[r, c]
+            if np.isnan(v):
+                continue
+            # 深底用白字、淺底用黑字（文字不吃系列色，只吃 ink）
+            rgba = cmap(norm(v))
+            lum = 0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2]
+            ax2.text(c, r, f"{v*100:+.1f}", ha="center", va="center",
+                     fontsize=7.8, color="white" if lum < 0.5 else C_INK)
+
+    ax2.set_title("同一份資料的年 × 月對照（數字為超額報酬百分點）",
+                  fontsize=11, color=C_INK2, pad=8)
+
+    cb = fig.colorbar(im, ax=ax2, fraction=0.025, pad=0.015)
+    cb.ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
+    cb.outline.set_visible(False)
+    cb.ax.tick_params(colors=C_INK2, labelsize=8)
+
+    plt.tight_layout()
+    fig.savefig(output_dir / "monthly_vs_market.png", dpi=150,
+                facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    print("  ✓ monthly_vs_market.png")
+    return m
+
+
+def plot_drawdown_vs_universe(ret_df: pd.DataFrame, output_dir: Path):
+    """**D1 相對等權宇宙**的回撤（relative drawdown）。
+
+    畫的是相對財富曲線 rel = (1+D1).cumprod() / (1+等權宇宙).cumprod() 的回撤，
+    不是兩條各自的水下曲線疊在一起——後者要讀者自己在腦中相減，而且兩條同時
+    下跌時（大盤系統性下殺）看起來很慘，實際上選股並沒有失分。
+
+    這條線的語意：
+      0     ＝ 相對等權宇宙的領先幅度正在創新高
+      −10%  ＝ 比「歷史最領先的時點」落後了 10%
+      觸底  ＝ 選股輸給「不選股」最多的時點
+      回到 0＝ 追回先前的領先高點
+
+    等權宇宙＝同一個流動性篩選宇宙裡完全不選股、每天等權持有全部成分股。
+    它比大盤更嚴格：大盤是市值加權的全市場，這條把「宇宙選擇」的貢獻也扣掉，
+    剩下的才是 decile 排序本身的加值。**這張圖跌，就是模型在扣分。**
+    """
+    if "universe_ew" not in ret_df.columns or "D1" not in ret_df.columns:
+        print("  ⚠ 缺 universe_ew / D1 欄，跳過 drawdown_vs_universe.png")
+        return None
+
+    rel, dd = relative_drawdown(ret_df["D1"], ret_df["universe_ew"])
+    if dd.empty:
+        print("  ⚠ 相對回撤序列為空，跳過 drawdown_vs_universe.png")
+        return None
+
+    episodes = drawdown_episodes(dd)
+    episodes.to_csv(output_dir / "drawdown_vs_universe_episodes.csv",
+                    index=False, encoding="utf-8-sig")
+
+    deepest = episodes.iloc[0]
+    longest = episodes.loc[episodes["days_underwater"].idxmax()]
+
+    fig, ax = plt.subplots(figsize=(13, 5.5))
+
+    # 最久那段先鋪底色，才不會蓋住主線
+    end = dd.index[-1] if bool(longest["ongoing"]) else longest["recovery"]
+    ax.axvspan(longest["peak"], end, color=C_STRAT, alpha=0.07, linewidth=0)
+
+    ax.plot(dd.index, dd.values, color=C_STRAT, linewidth=1.8,
+            label="D1 相對等權宇宙")
+    ax.fill_between(dd.index, dd.values, 0, color=C_STRAT, alpha=0.12, linewidth=0)
+
+    # 谷底：只標最深與最久這兩點
+    ax.plot([deepest["trough"]], [deepest["depth"]], "o", color=C_NEG,
+            markersize=9, markeredgecolor="white", markeredgewidth=2, zorder=5)
+    ax.annotate(
+        f"最深 {deepest['depth']:.1%}　{deepest['trough']:%Y-%m-%d}"
+        f"（水下 {int(deepest['days_underwater'])} 天）",
+        xy=(deepest["trough"], deepest["depth"]),
+        xytext=(10, 6), textcoords="offset points",
+        fontsize=9.5, color=C_INK, va="bottom",
+    )
+    if longest["peak"] != deepest["peak"]:
+        ax.annotate(
+            f"水下最久 {int(longest['days_underwater'])} 天"
+            f"（{longest['peak']:%Y-%m} → "
+            f"{'尚未追平' if bool(longest['ongoing']) else format(longest['recovery'], '%Y-%m')}）"
+            f"　深度 {longest['depth']:.1%}",
+            xy=(longest["trough"], longest["depth"]),
+            xytext=(0, -14), textcoords="offset points",
+            fontsize=9, color=C_INK2, ha="center", va="top",
+        )
+
+    ax.axhline(0, color=C_INK, linewidth=0.9)
+    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
+    ax.grid(axis="y", color=C_REF, alpha=0.18, linewidth=0.7)
+    ax.set_axisbelow(True)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.spines[["left", "bottom"]].set_color(C_REF)
+    ax.tick_params(colors=C_INK2)
+
+    # 兩者各自的絕對 MDD 放副標，作為對照的背景資訊（不佔主圖空間）
+    abs_mdd = {}
+    for key, col in (("D1", "D1"), ("宇宙", "universe_ew")):
+        cum = (1 + ret_df[col].fillna(0)).cumprod()
+        abs_mdd[key] = (cum / cum.cummax() - 1).min()
+    cap_label = f"　(Capital {CAPITAL_USAGE:.0%})" if CAPITAL_USAGE < 1 else ""
+    ax.set_title(f"D1 相對等權宇宙的回撤{cap_label}", fontsize=13, color=C_INK, pad=18)
+    ax.text(0.5, 1.015,
+            f"相對回撤 MDD {deepest['depth']:.1%}　|　"
+            f"各自的絕對 MDD：D1 {abs_mdd['D1']:.1%}、等權宇宙 {abs_mdd['宇宙']:.1%}",
+            transform=ax.transAxes, ha="center", va="bottom",
+            fontsize=9.5, color=C_INK2)
+    ax.set_ylabel("距「歷史最領先」的落後幅度", fontsize=9, color=C_INK2)
+    ax.margins(y=0.10)
+
+    plt.tight_layout()
+    fig.savefig(output_dir / "drawdown_vs_universe.png", dpi=150,
+                facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    print("  ✓ drawdown_vs_universe.png")
+    print("  ✓ drawdown_vs_universe_episodes.csv")
+    return episodes
 
 
 def plot_drawdown(ret_df: pd.DataFrame, output_dir: Path):
@@ -780,6 +1069,12 @@ def main():
     plot_decile_summary(metrics_df, OUTPUT_DIR)
     plot_annual_decile1(ret_df, OUTPUT_DIR)
     plot_drawdown(ret_df, OUTPUT_DIR)
+    # ★ 2026-08-04 新增兩張
+    monthly = plot_monthly_vs_market(ret_df, OUTPUT_DIR)
+    if not monthly.empty:
+        monthly.to_csv(OUTPUT_DIR / "monthly_returns.csv", encoding="utf-8-sig")
+        print(f"  ✓ monthly_returns.csv（{len(monthly)} 個月）")
+    plot_drawdown_vs_universe(ret_df, OUTPUT_DIR)
     episodes = plot_excess_drawdown(ret_df, OUTPUT_DIR)
 
     if episodes is not None and not episodes.empty:

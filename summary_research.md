@@ -47,6 +47,13 @@ namespace——同一個資料夾內本來就只跑一種設定。
 .venv/bin/python main_fix_0709.py            # walk-forward 訓練 → database/experiment/
 .venv/bin/python backtest_0709.py            # 依預測值回測 → output/backtest/
 
+# 🆕 2026-08-04：只補跑某幾折（其餘沿用既有產出）。資料多了一年、或某一折要
+# 換設定重跑時用，不必為了一折等完整的 9 折（約 2 小時）。
+# 原理：把 ML_WINDOW_START 抬到該測試年需要的最早訓練年，windows() 就只剩一折，
+# 訓練資料與整批跑時完全相同。expanding（TRAIN_YEARS_N=None）不支援。
+.venv/bin/python main_fix_0709.py --only-test-year 2026
+.venv/bin/python main_fix_0709.py --only-test-year 2024 2025 2026
+
 # 與 2026_daily 的三盞燈（見 7.1）。改完任何一邊都跑一次，三個旗標一起給。
 .venv/bin/python tools/check_objective_sync.py --code --data --config
 

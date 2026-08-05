@@ -75,6 +75,76 @@ def compute_liquidity_mask(
     return mask
 
 
+#: 行情凍結判定用的欄位（research 的 database_make/ 只有這兩欄；daily 端另有成交股數）
+STALE_CHECK_COLS: tuple[str, ...] = ("close", "amount")
+
+
+def find_stale_rows(
+    df,
+    window: int = 5,
+    date_col: str = "年月日",
+    code_col: str = "證券代碼",
+    cols: tuple[str, ...] = STALE_CHECK_COLS,
+):
+    """
+    標出「行情凍結」的列：同一檔股票連續 `window` 個交易日，`cols` 每一欄都逐字相同。
+
+    ★ 2026-08-04 從 2026_daily 的 `stock_list/trading_config.py::find_stale_codes`
+      移植過來（daily commit 7bdf5a5，2026-08-03）。
+
+    為什麼需要：daily 的下載端過去對 `price:` 類 dataset 做 ffill，已下市／長期
+    停牌的股票會把最後一筆真實行情**無限延續**下去，製造出「永遠有量、永遠不漲
+    不跌」的殭屍股。實例 6806 於 2026-06-23 終止上市，最後交易日的
+    close 3.51 / amount 23,068,336 被逐字複製到 07-30，而且**通過了流動性篩選**
+    （amount 凍結在下市前的水準，排名照樣進前 20%）。research 的
+    `database_make/` 是那次修正之前從 daily 搬過來的，所以仍帶著這批列。
+
+    對研究的傷害有兩層：
+      · 訓練端——凍結列的報酬恆為 0、特徵恆定，是純雜訊樣本
+      · 測試端——它們會進入 decile 排序，模型若把它們排進 D1，回測會拿到一個
+        現實中根本賣不掉的部位（daily 那邊實測會被選進應持有清單）
+
+    與 daily 版本的兩點差異，都是刻意的：
+      1. daily 回傳「代碼集合」（它只關心「今天能不能買這檔」）；這裡回傳
+         **逐列布林**——同一檔股票可能只有某一段時間凍結（實測 2327 在 2025 年
+         只有部分期間被標記），整檔剔除會誤殺正常交易的日子。
+      2. daily 用 收盤價/成交股數/成交金額 三欄，research 的資料只有 close 與
+         amount。兩欄同時逐字凍結已足以判定——amount 是大數，真實交易連續 5 天
+         完全相同的機率可忽略。
+
+    已知限制（與 daily 相同）：凍結的**前 window-1 天標不出來**，要湊滿視窗才
+    能確認。NaN 不算「相同」（`NaN == NaN` 為 False），所以真正沒有資料的列不會
+    被誤判為凍結——它們本來就會被流動性篩選擋掉。
+
+    回傳：與 `df` 同 index 的布林 Series，True = 該列行情凍結。
+    """
+    import pandas as pd
+
+    if window < 2:
+        raise ValueError(f"window 需 >= 2，得到 {window}")
+    use = [c for c in cols if c in df.columns]
+    if not use:
+        return pd.Series(False, index=df.index)
+
+    order = df.sort_values([code_col, date_col]).index
+    s = df.loc[order]
+
+    # 與「前一列」相比每一欄都相同（且同一檔股票）
+    same_as_prev = pd.Series(True, index=order)
+    for c in use:
+        prev = s[c].shift(1)
+        same_as_prev &= (s[c] == prev)          # NaN == NaN → False，符合上面的說明
+    same_as_prev &= (s[code_col] == s[code_col].shift(1))
+
+    # 連續 window-1 次「與前一列相同」＝ window 列逐字相同
+    run = (same_as_prev.groupby(s[code_col].values)
+           .rolling(window - 1, min_periods=window - 1).sum()
+           .reset_index(level=0, drop=True))
+    stale = (run == window - 1).fillna(False)
+
+    return stale.reindex(df.index).fillna(False).astype(bool)
+
+
 def liq_tag(w1: float, w2: float, keep_ratio: float) -> str:
     """
     篩選參數 → tag 字串（與 805_group2 summary 命名慣例一致）。
