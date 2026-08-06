@@ -41,7 +41,8 @@ backtest_real.py
   [新買入濾網] `recorder.py::select_additions` + `_pick_with_constraints`
     1. in_filter = 1        本 repo 天生成立（predictions.csv 只含篩選後宇宙）
     2. 5MA 成交金額 > 1 億   MIN_AMOUNT_TO_BUY；NaN 視為不合格
-    3. 當日漲幅 <= 5%        MAX_CHG_TO_BUY；chg 為 NaN（無前一交易日收盤）→ 剔除
+    3. 當日漲幅 <= 7%        MAX_CHG_TO_BUY（2026-08-05 由 5% 放寬）；chg 為 NaN
+                            （無前一交易日收盤）→ 剔除
     4. 非行情凍結
     5. pred_score >= 0       模型預期報酬為負就不買，寧可留現金（daily 2026-08-01 起）
     6. 估得出張數            以漲停價 × 手續費估整張成本，1 張即超 BUY_MAX_AMOUNT → 跳過
@@ -137,7 +138,32 @@ PROB_STD_MULT     = 2.0      # 換股門檻：挑戰者需高出衛冕者 N × s
 CLUSTER_CAP       = 2        # 同一 clu_id_daily 最多持有幾檔
 
 # ── 新買入濾網（對應 daily/stock_list/trading_config.py）────────────────────
-MAX_CHG_TO_BUY    = 0.05         # 當日漲幅上限（追高 / 漲停買不到）
+# ★★ 2026-08-05：MAX_CHG_TO_BUY 0.05 → 0.07，對齊 daily 線上（使用者決定）★★
+#   來源與完整證據見 ~/Desktop/2026_tune/summary_tune.md §9.2–§9.5，以及
+#   daily stock_list/trading_config.py 的註解（含保留意見與回滾方式）。
+#   摘要：逐年勝 7/9，排除 2021 仍 +4.0pp (p_boot=0.068)；換手率幾乎不變
+#   （不是靠多交易換來的）。⚠ 未達傳統顯著水準、滑價未模擬、只在一份
+#   predictions 源上驗過。
+#
+#   ★ 2026-08-06 更正效果幅度（~/Desktop/1111_monthholding §11）★
+#     這裡原本寫的是 sharpe 1.5023→1.6301、年化 60.4%→68.5%、
+#     excess_mdd −33.4%→−29.8%——那是**單一抽樣**（一份 predictions、一個 seed）。
+#     只換 LightGBM 的 seed 重訓，年化本身就會晃 23.6pp：單一抽樣的 Δ 把共模的
+#     seed 噪音算進了效果，系統性高估。改用「同一 seed 內只改這道濾網」的配對
+#     設計（6 抽樣、共模噪音抵銷）後：
+#         幾何年化   +2.96pp   5/6 正向   符號檢定 p=0.109
+#         sharpe     +0.045    5/6 正向   p=0.109
+#     ⟹ 引用一律用 +2.96pp / +0.045，舊數字高估約 2.7 倍。
+#     ⟹ 方向仍成立，**不需要回滾 0.07**。
+#     ❌ **「同時降低回撤」已撤回**：配對複驗下 MDD 只有 4/6 為正、p=0.344
+#        （有兩個抽樣反而更差）。年化與 sharpe 的方向可信，MDD 不可信。
+#     ⚠ 1111 用的是 nz5 predictions，與本 repo 不同源 → 絕對數字不可對照，
+#       只能看配對差的方向。
+#   ⚠ 不要再往上放：0.10 等於實質關閉（台股上限就是 10%），其好處 100% 來自
+#     2021–2023，2024–2026 為 0。
+#   ⚠ **此值一改，先前所有以 0.05 跑出的 backtest_real 數字都不再同基準可比**
+#     （含 2026_tune §9.1/§9.2 的表）。要沿用舊數字就顯式設回 0.05。
+MAX_CHG_TO_BUY    = 0.07         # 當日漲幅上限（追高 / 漲停買不到）
 MIN_AMOUNT_TO_BUY = 100_000_000  # 5MA 成交金額下限（元）＝公司版一億
 AMOUNT_MA_DAYS    = 5            # 成交金額移動平均天數
 STALE_WINDOW      = 5            # 行情凍結判定視窗（交易日）

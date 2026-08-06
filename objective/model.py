@@ -656,10 +656,34 @@ class WalkForwardTrainer:
                 n_splits      = self.cfg.n_splits,
                 sample_weight = train_weight,
                 dates         = train_dates,
+                random_state  = self.cfg.random_state,   # ★ 2026-08-06，見下
             )
 
         print("  訓練最終模型...")
-        model = train_final_lgb(X_train, y_train, best_params, train_weight)
+        # ★ 2026-08-06 修正：這兩個呼叫端原本都沒傳 random_state。
+        #
+        #   `collect_oof_prob` / `train_final_lgb` 的簽名都有 `random_state: int|None
+        #   = None`，內部也確實會 `params["seed"] = random_state`——但**只有在有傳的
+        #   時候**。沒傳就是 None，`_LGB_BASE_PARAMS` 裡也沒有 seed，於是整條
+        #   walk-forward 路徑吃的是 LightGBM 自己的預設種子：結果仍可重現，卻
+        #   **完全不隨 cfg.random_state 變動**。
+        #
+        #   怎麼發現的：2026_tune 用 SEEDS=(42, 7, 2026) 各跑一遍同一組設定做跨 seed
+        #   穩健性檢查，排名表上每一組的 ic_std 都是 0.000000——查下去發現三個 seed
+        #   的 predictions.csv **byte 完全相同**。39 個 run 只有 13 組相異結果，
+        #   約 4 小時是重複計算。
+        #
+        #   為什麼三盞燈沒照到：對拍比的是 research↔daily 的 objective/，而這個 bug
+        #   兩邊**一模一樣地缺**（AST 相同 → 綠燈）。真正的對照組是
+        #   daily_model/trainer.py——每日線上預測那條路徑三個呼叫端都有傳，
+        #   所以**線上每日流程不受影響**，受影響的只有離線 walk-forward。
+        #   對拍能抓「兩份副本漂掉」，抓不到「同一件事的兩個實作不一致」。
+        #
+        #   ⚠ 這個修正會改變 walk-forward 的數值（從 LightGBM 預設種子換成
+        #     cfg.random_state=42）。差異是純種子差異、不是方法改變，但既有
+        #     experiment/ 產出與修正後的**不可直接比較**。
+        model = train_final_lgb(X_train, y_train, best_params, train_weight,
+                                random_state=self.cfg.random_state)
 
         # ★ 2026-07-27：逐日 IC 平均（舊版 pooled 含日間變異，會系統性高估）
         oof_ic = evaluate_oof_ic(y_train, oof_pred, dates=train_dates)
