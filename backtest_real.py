@@ -601,8 +601,9 @@ def simulate(panel: Panel, A: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.Data
             [codes[c] for c in held], PROB_STD_MULT)
         threshold = prob_mult * prob_std
 
+        forced_set = set(forced)
         if ENABLE_HYSTERESIS:
-            incumbents = sorted((c for c in held if c not in set(stale_held)), key=prob)
+            incumbents = sorted((c for c in held if c not in forced_set), key=prob)
             ci = 0
             for inc in incumbents:
                 if ci >= len(cand):
@@ -618,7 +619,7 @@ def simulate(panel: Panel, A: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.Data
         else:
             # 對照模式：不做 hysteresis，持倉全數釋出、每日重挑前 TARGET_N 名
             for c in held:
-                if c not in set(stale_held):
+                if c not in forced_set:
                     removed.append(c)
                     trade_rows.append({"年月日": date, "證券代碼": codes[c], "側": "賣",
                                        "原因": "每日重排", "pred": prob(c), "gap": np.nan})
@@ -628,9 +629,14 @@ def simulate(panel: Panel, A: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.Data
         for c in stale_held:
             trade_rows.append({"年月日": date, "證券代碼": codes[c], "側": "賣",
                                "原因": "行情凍結強制賣出", "pred": prob(c), "gap": np.nan})
+        for c in illiquid_held:
+            trade_rows.append({"年月日": date, "證券代碼": codes[c], "側": "賣",
+                               "原因": "流動性不足強制賣出", "pred": prob(c), "gap": np.nan})
 
         removed_set = set(removed)
         kept = [c for c in held if c not in removed_set]
+        for c in removed_set:
+            last_pred.pop(c, None)     # 下次買回時重新起算，不沿用上一段的舊分數
 
         # ── 回補：目標 TARGET_N，含歷史缺額（非僅當日移除數）──────────────
         fill_count = max(0, TARGET_N - len(kept))
@@ -706,6 +712,9 @@ def simulate(panel: Panel, A: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.Data
 
     if nan_ret_count:
         print(f"  [WARN] 持倉報酬為 NaN 共 {nan_ret_count:,} 格（該股該日無行情），已以 0 計。")
+    if OOB_POLICY != "sell":
+        print(f"  [OOB_POLICY={OOB_POLICY}] 靠 policy 續命的持倉日數：{oob_kept_days:,}"
+              f"（若為 'sell' 這些部位當天就被無條件淘汰）")
 
     daily = pd.DataFrame(daily_rows).set_index(DATE_COL).sort_index()
     filters = pd.DataFrame(filter_rows)
@@ -842,6 +851,8 @@ def main():
           f"{'' if ENABLE_HYSTERESIS else '  ← 已關閉（每日重排）'}")
     print(f"  集中度動態門檻  : β={CONC_MULT_BETA}"
           f"{f'（mu={CONC_MULT_MU} sd={CONC_MULT_SD}，單邊）' if CONC_MULT_BETA else '  ← 已停用'}")
+    print(f"  域外持倉處置    : OOB_POLICY={OOB_POLICY}"
+          f"{'（＝線上行為）' if OOB_POLICY == 'model' else '  ← 非線上口徑'}")
     print(f"  成本            : 買 {BUY_COST_RATE:.4%} / 賣 {SELL_COST_RATE:.4%}"
           f"（來回 {BUY_COST_RATE + SELL_COST_RATE:.4%}）")
     print(f"  濾網            : 金額>{MIN_AMOUNT_TO_BUY / 1e8:.0f}億={ENABLE_AMOUNT_FILTER} "
@@ -906,6 +917,9 @@ def main():
 
     run_config = {
         "TARGET_N": TARGET_N, "PROB_STD_MULT": PROB_STD_MULT, "CLUSTER_CAP": CLUSTER_CAP,
+        "OOB_POLICY": OOB_POLICY,
+        "FULL_PRED_PATH": (str(FULL_PRED_PATH.relative_to(_ROOT))
+                           if FULL_PRED_PATH.exists() else None),
         "CONC_MULT_BETA": CONC_MULT_BETA, "CONC_MULT_MU": CONC_MULT_MU,
         "CONC_MULT_SD": CONC_MULT_SD,
         "MAX_CHG_TO_BUY": MAX_CHG_TO_BUY, "MIN_AMOUNT_TO_BUY": MIN_AMOUNT_TO_BUY,
