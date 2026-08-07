@@ -574,13 +574,14 @@ def simulate(panel: Panel, A: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.Data
 
         # ── 強制賣出：掉出宇宙且**絕對**流動性不足（只有 "liquid" 會走這條）──
         #   區分「真的不能交易」與「只是被別人擠出前 20% 排名」。
+        illiquid_held: list[int] = []
         if OOB_POLICY == "liquid":
-            _fset = set(forced)
             for c in held:
-                if c in _fset or np.isfinite(p[c]):
+                if c in set(forced) or np.isfinite(p[c]):
                     continue
                 if not (np.nan_to_num(amt5[i, c], nan=0.0) > MIN_AMOUNT_TO_BUY):
-                    forced.append(c)
+                    illiquid_held.append(c)
+            forced += illiquid_held
 
         if OOB_POLICY != "sell":
             fset = set(forced)
