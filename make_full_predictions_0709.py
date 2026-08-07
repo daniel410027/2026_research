@@ -54,26 +54,27 @@ make_full_predictions_0709.py
            coverage.csv                  逐年覆蓋率與驗證關卡的比對結果
 
 ─────────────────────────────────────────────
-  ⚠ 在本 repo（2026_research）直接執行會卡在驗證關卡
+  本 repo 的產出沿革（2026-08-07 已就地重跑，✅ 結案）
 ─────────────────────────────────────────────
-  2026-08-07 由 ~/Desktop/1111_monthholding 移植過來。**現有的
-  database/experiment_full/ 是在 1111_monthholding 產生後複製過來的**，
-  不是在這裡跑出來的。理由：
+  2026-08-07 由 ~/Desktop/1111_monthholding 移植過來時，`database/experiment_full/`
+  是**從 1111 複製**的，不是在這裡跑出來的——當時本 repo 的 `database/experiment/`
+  還是 random_state 修正前的產出（`*_L4`），在這裡重訓會得到 seed=42 的模型，
+  驗證關卡必然報錯。
 
-    · 本 repo 的 `objective/model.py` 有 2026-08-06 的 random_state 修正
-      （把 cfg.random_state 傳給 train_final_lgb / collect_oof_prob），
-      1111_monthholding 那份沒有。
-    · 但兩邊現有的 `database/experiment/*/predictions.csv` 是 **byte 相同**的
-      ——都是修正**之前**用 LightGBM 預設種子產生的。
-    · 於是在這裡重訓會得到 seed=42 的模型，第 4 條驗證關卡（宇宙內預測必須與
-      現有 predictions.csv 逐筆相同）會直接報錯。那是關卡正常運作，不是 bug。
+  **當天稍晚已解除**：`main_fix_0709.py` 用修正後的 `objective/model.py` 重跑完
+  9 個 window（`*_L4z`，precomputed 換成 `_nz5`），舊的 `*_L4` 批搬到
+  `database/experiment_archive_preseedfix/`。本檔隨即就地重跑，
+  **九折全部通過驗證關卡，最大絕對差皆為 0.000e+00**（見 coverage.csv）。
 
-  所以複製過來是安全的：兩邊的 predictions.csv 相同 ⟹ 1111 那份 experiment_full
-  通過的驗證關卡對本 repo 同樣成立（coverage.csv 九個 window 的最大絕對差皆為 0.0）。
+  ★ 這是這條鏈第一次真的驗到。先前 1111 的 `experiment_full_nz5` 之所以
+    coverage.csv 整欄留白，是因為關卡去找 `database/experiment/{window}_L4z/`，
+    而那裡只有 `*_L4`——`verify` 分支被靜默跳過。**那不是通過，是沒跑。**
+    現在 `*_L4z` 就在 `database/experiment/` 底下，關卡讀得到對應目錄。
 
-  什麼時候才該在這裡重跑本檔：等 `database/experiment/` 用修正後的 model.py
-  重新產生之後——那時 predictions.csv 會改變，這份 experiment_full 就失效，
-  必須連同重跑。
+  什麼時候要再跑本檔：`database/experiment/` 只要重新產生就得跟著重跑。
+  否則宇宙內分數（來自 experiment/）與域外分數（來自 experiment_full/）
+  會來自兩個不同的模型——`backtest_real.py` 在 OOB_POLICY="model" 下會照跑不誤，
+  不會有任何警告。
 
 作者：Daniel Huang
 """
@@ -314,4 +315,8 @@ def run(train_dir: Path | None = None,
 
 
 if __name__ == "__main__":
-    main()
+    # ⚠ 這裡原本寫 main()，但本檔的進入點是 run()——沒有 def main。
+    #   於是 `python3 make_full_predictions_0709.py` 一直是 NameError，
+    #   過去都只能 `from make_full_predictions_0709 import run; run()`。
+    #   2026-08-07 修正（1111 與 2026_research 兩份同時改）。
+    run()

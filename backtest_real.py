@@ -93,6 +93,8 @@ backtest_real.py
     drawdown.png             淨值水下曲線
     annual_returns.png       逐年報酬（淨 vs 大盤 vs D1 cost0）
     holdings_turnover.png    持倉檔數與換手率時序（看濾網何時咬得最兇）
+    monthly_vs_market.png    每月超額報酬（bar + 年×月熱圖），口徑同 backtest_0709
+    yearly/<年>.png          一年一張：年內累積報酬 / 單邊換手率 / 年化波動度
     run_config.json          本次跑的完整設定（可重現）
 
 作者：Daniel Huang
@@ -118,6 +120,7 @@ from backtest_0709 import (
     load_all_predictions,
     load_market_return,
     calc_metrics,
+    plot_monthly_vs_market,
     DATE_COL,
 )
 
@@ -837,6 +840,131 @@ def plot_holdings_turnover(daily: pd.DataFrame, output_dir: Path):
     plt.close(fig)
 
 
+# ── 一年一張的三面板 ────────────────────────────────────────
+# 三個量的單位完全不同（%、換手率、年化波動），所以是三個 panel 共用 x 軸，
+# 不是三條線擠一張圖配兩個 y 軸——雙 y 軸會讓交叉點看起來像事件，其實只是刻度巧合。
+Y_NET  = "#2a78d6"   # 實單淨值
+Y_GRS  = "#e08214"   # 實單毛值（不含成本）
+Y_MKT  = "#6b6a66"   # 大盤（中性灰，參考序列）
+Y_INK  = "#0b0b0b"
+Y_INK2 = "#52514e"
+VOL_WIN = 20         # 滾動視窗（交易日）；與 holdings_turnover 的換手率一致
+
+
+def _year_stats(r: pd.Series, m: pd.Series) -> dict:
+    cum = (1 + r).prod() - 1
+    dd  = ((1 + r).cumprod() / (1 + r).cumprod().cummax() - 1).min()
+    sd  = r.std(ddof=1) * np.sqrt(ANNUAL_DAYS)
+    return {
+        "ret": cum,
+        "mkt": (1 + m).prod() - 1,
+        "vol": sd,
+        "sharpe": (r.mean() * ANNUAL_DAYS) / sd if sd > 0 else np.nan,
+        "mdd": dd,
+    }
+
+
+def plot_yearly_panels(ret_df: pd.DataFrame, daily: pd.DataFrame, output_dir: Path):
+    """每個曆年一張圖：年內累積報酬 / 單邊換手率 / 年化波動度。
+
+    滾動量（換手率、波動）先在全期序列上算完再切年，否則每年 1 月都是空窗，
+    看起來像是年初沒交易——那是視窗還沒填滿，不是事實。
+    """
+    out_dir = output_dir / "yearly"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    turnover_full = (daily["n_buy"] / TARGET_N).rolling(VOL_WIN).mean()
+    vol_net  = ret_df["net"].rolling(VOL_WIN).std(ddof=1) * np.sqrt(ANNUAL_DAYS)
+    vol_mkt  = ret_df["market"].rolling(VOL_WIN).std(ddof=1) * np.sqrt(ANNUAL_DAYS)
+
+    years = sorted(ret_df.index.year.unique())
+    for y in years:
+        sl  = ret_df.index.year == y
+        idx = ret_df.index[sl]
+        if len(idx) < 5:
+            continue
+        r_net, r_grs = ret_df.loc[sl, "net"], ret_df.loc[sl, "gross"]
+        r_mkt = ret_df.loc[sl, "market"]
+        st = _year_stats(r_net.dropna(), r_mkt.dropna())
+
+        fig, axes = plt.subplots(
+            3, 1, figsize=(13, 10.5), sharex=True,
+            gridspec_kw={"height_ratios": [1.45, 1.0, 1.0], "hspace": 0.22},
+        )
+        ax1, ax2, ax3 = axes
+
+        # ── 1. 年內累積報酬（年初歸零，年內複利） ──────────
+        for s, color, label, lw in (
+            (r_net, Y_NET, "實單淨值（含成本）", 2.0),
+            (r_grs, Y_GRS, "實單毛值（不含成本）", 1.5),
+            (r_mkt, Y_MKT, "大盤", 1.5),
+        ):
+            cum = (1 + s.fillna(0)).cumprod() - 1
+            ax1.plot(idx, cum.values, color=color, linewidth=lw, label=label,
+                     solid_capstyle="round")
+            # 只在線尾直接標數字，不是每個點都標
+            ax1.annotate(f"{cum.iloc[-1]:+.1%}", xy=(idx[-1], cum.iloc[-1]),
+                         xytext=(6, 0), textcoords="offset points",
+                         va="center", fontsize=9, color=Y_INK2)
+        ax1.axhline(0, color=Y_INK, linewidth=0.8)
+        ax1.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
+        ax1.set_ylabel("年內累積報酬", fontsize=9, color=Y_INK2)
+        ax1.legend(loc="upper left", frameon=False, fontsize=9)
+        n_days = int(len(idx))
+        partial = "　(部分年度)" if n_days < 200 else ""
+        ax1.set_title(
+            f"{y} 年　實單淨 {st['ret']:+.1%}　大盤 {st['mkt']:+.1%}　"
+            f"超額 {st['ret'] - st['mkt']:+.1%}　"
+            f"Sharpe {st['sharpe']:.2f}　MDD {st['mdd']:.1%}　"
+            f"{n_days} 個交易日{partial}",
+            fontsize=13, color=Y_INK, pad=12,
+        )
+
+        # ── 2. 單邊換手率 ──────────────────────────────────
+        t = turnover_full.reindex(idx)
+        ax2.plot(idx, t.values * 100, color=Y_NET, linewidth=1.4)
+        ax2.fill_between(idx, 0, t.values * 100, color=Y_NET, alpha=0.12, linewidth=0)
+        t_mean = float((daily.loc[daily.index.year == y, "n_buy"] / TARGET_N).mean())
+        ax2.axhline(t_mean * 100, color=Y_INK2, linestyle="--", linewidth=1.0)
+        # 標在線尾外側，避開換手率曲線本身
+        ax2.annotate(f"年均 {t_mean:.1%}", xy=(idx[-1], t_mean * 100),
+                     xytext=(6, 0), textcoords="offset points",
+                     va="center", fontsize=9, color=Y_INK2)
+        ax2.set_ylim(bottom=0)
+        ax2.set_ylabel("單邊換手率", fontsize=9, color=Y_INK2)
+        ax2.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=100, decimals=0))
+        ax2.set_title(f"單邊換手率（{VOL_WIN} 日移動平均；買進檔數 ÷ TARGET_N={TARGET_N}）",
+                      fontsize=10.5, color=Y_INK2, pad=6)
+
+        # ── 3. 年化波動度 ──────────────────────────────────
+        ax3.plot(idx, vol_net.reindex(idx).values * 100, color=Y_NET,
+                 linewidth=1.6, label="實單淨值")
+        ax3.plot(idx, vol_mkt.reindex(idx).values * 100, color=Y_MKT,
+                 linewidth=1.4, label="大盤")
+        ax3.set_ylim(bottom=0)
+        ax3.set_ylabel("年化波動度", fontsize=9, color=Y_INK2)
+        ax3.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=100, decimals=0))
+        ax3.legend(loc="upper left", frameon=False, fontsize=9)
+        ax3.set_title(f"年化波動度（{VOL_WIN} 日滾動標準差 × √{ANNUAL_DAYS}；"
+                      f"全年 {st['vol']:.1%}）",
+                      fontsize=10.5, color=Y_INK2, pad=6)
+        ax3.set_xlabel("日期", fontsize=9, color=Y_INK2)
+
+        for ax in axes:
+            ax.grid(axis="y", color=Y_MKT, alpha=0.18, linewidth=0.7)
+            ax.set_axisbelow(True)
+            ax.spines[["top", "right"]].set_visible(False)
+            ax.spines[["left", "bottom"]].set_color(Y_MKT)
+            ax.tick_params(colors=Y_INK2, labelsize=9)
+        ax1.set_xlim(idx[0], idx[-1])
+
+        fig.savefig(out_dir / f"{y}.png", dpi=150,
+                    facecolor="white", bbox_inches="tight")
+        plt.close(fig)
+
+    print(f"  ✓ yearly/*.png（{len(years)} 個年度）")
+
+
 # ============================================================
 #  主流程
 # ============================================================
@@ -943,6 +1071,14 @@ def main():
     plot_drawdown(ret_df, OUTPUT_DIR)
     plot_annual(ret_df, OUTPUT_DIR)
     plot_holdings_turnover(daily, OUTPUT_DIR)
+    # 月超額用 net（含成本的實單報酬）——這裡的問題是「實際下單每月贏大盤幾趴」，
+    # 不是紙上組合，所以不能用 D1_cost0。
+    plot_yearly_panels(ret_df, daily, OUTPUT_DIR)
+    monthly = plot_monthly_vs_market(ret_df, OUTPUT_DIR,
+                                     strat_col="net", strat_label="實單淨值")
+    if not monthly.empty:
+        monthly.to_csv(OUTPUT_DIR / "monthly_returns.csv", encoding="utf-8-sig")
+        print(f"  ✓ monthly_returns.csv（{len(monthly)} 個月）")
 
     print("\n" + "=" * 70)
     print("  績效指標")

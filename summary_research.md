@@ -1201,6 +1201,50 @@ daily 2026-07-28 那次跨 seed 複核也不受影響——那走 `tune_mode="OP
 → **§5.5 那句已劃掉並更正，判準寫在 §9-#22。** 重跑既有產出時請一併採用
 「配對／多 seed 比分布」的規格，否則重跑出來的仍然只是換了一格的單一抽樣。
 
+#### 6.5.1 重跑已完成（2026-08-07）✅
+
+`database/experiment/` 已用修正後的 `objective/model.py`（`random_state=42` 確實
+生效）重新產生，整條下游鏈跟著跑完：
+
+| 步驟 | 產出 | 耗時 |
+|---|---|---|
+| `main_fix_0709.py` | `database/experiment/*_L4z` 9 折 | ~100 分 |
+| `make_full_predictions_0709.py` | `database/experiment_full/` | 4 分 |
+| `backtest_0709.py` | `output/backtest/` | 9 秒 |
+| `backtest_real.py` | `output/backtest_real/` | 17 秒 |
+
+**命名變了**：新產出是 `*_L4z`（`precomputed_dir` 換成 `..._nz5`），舊的 `*_L4`
+整批搬到 `database/experiment_archive_preseedfix/`（附 README）。兩批**不能共存**
+在 `database/experiment/` 下——`load_all_predictions()` 是 glob `*/predictions.csv`，
+所幸 2026-08-04 加的混用偵測認得 `L4` ≠ `L4z`，會 raise 而非靜默混用。
+
+**驗證關卡這次是真的跑了**：九折的「宇宙內預測值必須與 predictions.csv 逐筆相同」
+全部通過，最大絕對差皆為 `0.000e+00`。
+⚠ 對照組：1111 的 `experiment_full_nz5` 當初 coverage.csv 整欄留白，那是因為關卡
+去找 `database/experiment/{window}_L4z/` 而該處只有 `*_L4`，`verify` 分支被靜默
+跳過。**留白不是通過，是沒跑。**
+
+新的基準數字（`OOB_POLICY="model"`、`CONC_MULT_BETA=0.20`）：
+
+| series | 年化 | Sharpe | MDD | Calmar | IR |
+|---|---:|---:|---:|---:|---:|
+| 實單淨值（含成本） | 56.84% | 1.359 | −44.51% | 1.277 | 1.067 |
+| 實單毛值 | 142.45% | 2.490 | −38.91% | 3.661 | 2.389 |
+| D1（cost0，紙上） | 237.57% | 3.596 | −40.30% | 5.895 | 3.693 |
+| 大盤 | 17.23% | 1.034 | −31.89% | 0.540 | — |
+
+年化成本拖累 43.66%、日均單邊換手 0.2965、平均持倉 9.86 檔。
+
+⚠ **不要拿這組數字跟重跑前的做「修好 seed 讓績效變好/變壞」的結論。** 依上面
+自己寫的判準，單次重跑只是換了一格的單一抽樣，而 §7 已量到只換 seed 的年化全距就有
+23.6pp——遠大於任何單點差異。而且 `output/` 被 gitignore，重跑前的數字已被覆寫，
+本來也取不到。要談效果就得跑配對設計。
+
+順帶修掉一個 **1111 與本 repo 都有的 bug**：`make_full_predictions_0709.py` 結尾
+寫 `main()`，但該檔只有 `def run()`——直接 `python3` 執行一律 NameError。
+過去都是 `from make_full_predictions_0709 import run; run()` 才跑得動，所以沒被
+發現。兩份同時改成 `run()`。
+
 ---
 
 ## 7. 與 2026_daily 的關係

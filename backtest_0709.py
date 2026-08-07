@@ -607,13 +607,16 @@ def plot_annual_decile1(ret_df: pd.DataFrame, output_dir: Path):
     print("  ✓ annual_decile1.png")
 
 
-def monthly_table(ret_df: pd.DataFrame) -> pd.DataFrame:
-    """每月報酬表：D1 / 大盤 / 超額（皆為當月日報酬複利後的月報酬）。
+def monthly_table(ret_df: pd.DataFrame, strat_col: str = "D1") -> pd.DataFrame:
+    """每月報酬表：策略 / 大盤 / 超額（皆為當月日報酬複利後的月報酬）。
 
-    超額 = D1月報酬 − 大盤月報酬（兩個月報酬的算術差），不是日超額的複利——
+    超額 = 策略月報酬 − 大盤月報酬（兩個月報酬的算術差），不是日超額的複利——
     後者會混進複利交互項，不是「這個月贏大盤幾趴」的直覺意思。
+
+    strat_col 讓 backtest_real 用同一份定義餵自己的 net（實單淨報酬），
+    兩邊的「月超額」才是同一個東西。
     """
-    d1  = ret_df["D1"].dropna()
+    d1  = ret_df[strat_col].dropna()
     mkt = ret_df["market"].dropna()
     comp = lambda r: (1 + r).prod() - 1
     m_d1  = d1.groupby(pd.Grouper(freq="ME")).apply(comp)
@@ -624,7 +627,9 @@ def monthly_table(ret_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def plot_monthly_vs_market(ret_df: pd.DataFrame, output_dir: Path) -> pd.DataFrame:
+def plot_monthly_vs_market(ret_df: pd.DataFrame, output_dir: Path,
+                           strat_col: str = "D1",
+                           strat_label: str = "D1") -> pd.DataFrame:
     """每月贏／輸大盤幾趴。
 
     上panel：逐月超額報酬（diverging bar，藍＝贏、紅＝輸，零軸為基準）
@@ -634,7 +639,7 @@ def plot_monthly_vs_market(ret_df: pd.DataFrame, output_dir: Path) -> pd.DataFra
     誰高誰低要一根一根比。問題本身（「跟大盤相比幾趴」）就是個差值，
     直接畫差值才是回答問題，不是把兩個數擺在一起讓讀者自己減。
     """
-    m = monthly_table(ret_df)
+    m = monthly_table(ret_df, strat_col)
     if m.empty:
         print("  ⚠ 月報酬表為空，跳過 monthly_vs_market.png")
         return m
@@ -667,7 +672,7 @@ def plot_monthly_vs_market(ret_df: pd.DataFrame, output_dir: Path) -> pd.DataFra
 
     win = (vals > 0).sum()
     ax1.set_title(
-        f"D1 每月超額報酬 vs 大盤　"
+        f"{strat_label} 每月超額報酬 vs 大盤　"
         f"（勝率 {win}/{len(vals)} = {win/len(vals):.0%}　"
         f"月均 {vals.mean():+.2%}　中位 {np.median(vals):+.2%}）",
         fontsize=13, color=C_INK, pad=10,
