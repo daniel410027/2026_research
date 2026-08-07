@@ -131,11 +131,53 @@ _ROOT = Path(__file__).resolve().parent
 EXPERIMENT_DIR    = _ROOT / "database" / "experiment"
 DATABASE_MAKE_DIR = _ROOT / "database_make"
 OUTPUT_DIR        = _ROOT / "output" / "backtest_real"
+# 未篩選全市場的模型分數（OOB_POLICY="model" 用）；由 make_full_predictions_0709.py 產生
+FULL_PRED_PATH    = _ROOT / "database" / "experiment_full" / "predictions_full.csv"
 
 # ── 組合規則（對應 daily/stock_list/order_recorder/recorder_config.py）──────
 TARGET_N          = 10       # 目標持倉檔數
 PROB_STD_MULT     = 2.0      # 換股門檻：挑戰者需高出衛冕者 N × std(pred_score)
 CLUSTER_CAP       = 2        # 同一 clu_id_daily 最多持有幾檔
+
+# ── 產業集中度 → 動態換股門檻 ───────────────────────────────────────────────
+# 持倉越集中在單一產業，換股門檻越高（越不容易換股）。單邊：集中度低於平均時
+# **不放鬆**門檻。
+#
+#     mult = PROB_STD_MULT × (1 + CONC_MULT_BETA × z)
+#     z    = max( (盤前持倉最大產業佔比 − CONC_MULT_MU) / CONC_MULT_SD , 0 )
+#
+# 為什麼有效：持倉集中時，排序前段的挑戰者與最差衛冕者高機率是同一個產業的股票。
+# 換過去付全額成本，換到的卻是高度相關的替代品——分散度沒改善、預期報酬只高一點點，
+# 不夠付過路費。這道規則把這類換股濾掉。
+#
+# ★ 與「全域調高 PROB_STD_MULT」完全不同：後者連分散的、有價值的換股一起砍，
+#   2.0 → 3.0 讓年化從 49% 掉到 36%。選對時機少換 vs 一律少換差了 22 個百分點。
+#
+# 證據（~/Desktop/1111_monthholding，2018-01 ~ 2026-07，103 個月）：
+#     β = 0      年化 49.43%  Sharpe 1.30  MDD −34.47%  輸大盤 44 個月  成本 3.85%/月
+#     β = 0.20   年化 55.54%  Sharpe 1.45  MDD −33.33%  輸大盤 42 個月  成本 3.49%/月
+#
+#   採用的理由是穩健性，不是上面兩個數字：
+#     · β ∈ [0.05, 0.35] 連續 7 個網格點全部打敗基準（Sharpe 1.35–1.52），寬平台非尖峰
+#     · 56 個可能切點中，前後兩段 Sharpe 同時改善者 56/56
+#     · 68 個滾動 36 個月窗口中，Sharpe 改善者 68/68
+#     · 改善分散在 83/103 個月，最大 3 個月只佔總變動 12%（無單月依賴）
+#     · 月報酬差 +0.49pp，t = 2.76；成本隨 β 單調下降，機制可解釋
+#
+#   ⚠ β 是在同一份 103 個月資料上試約 20 種設定挑出來的。單看 p = 0.007 漂亮，
+#     多重檢定校正（×20）後為 0.14，不顯著。站得住的是上面的穩健性形狀，不是 p 值。
+#     故取平台中段 0.20，而非峰值 0.15 / 0.25。
+#
+# mu / sd 用固定常數而非滾動估計：線上 daily 每天無狀態執行，滾動統計要存狀態檔，
+# 重跑會污染。回測顯示八年幾乎不漂移（mu 0.631–0.651、sd 0.171–0.182），且結果
+# 對其不敏感（mu 0.60/0.65/0.70 → Sharpe 1.47/1.45/1.47）。固定常數版與擴張窗口版
+# 結果幾乎相同（年化 55.54% vs 55.19%，Sharpe 皆 1.45）。
+#
+# 線上對應：daily/stock_list/trading_config.py::concentration_prob_mult
+# （該處預設 CONC_MULT_BETA = 0.0 停用，需人工決定何時開啟）
+CONC_MULT_BETA    = 0.20     # 0 = 停用（回到原本的固定 PROB_STD_MULT）
+CONC_MULT_MU      = 0.65     # 持倉最大產業佔比的長期平均
+CONC_MULT_SD      = 0.18     # 同上的標準差
 
 # ── 新買入濾網（對應 daily/stock_list/trading_config.py）────────────────────
 # ★★ 2026-08-05：MAX_CHG_TO_BUY 0.05 → 0.07，對齊 daily 線上（使用者決定）★★
@@ -189,11 +231,105 @@ ENABLE_UNITS_FILTER    = True
 ENABLE_CLUSTER_FILTER  = True
 ENABLE_HYSTERESIS      = True    # 關掉 → 每日重排前 10 名（成本會暴增）
 
+# ── 持倉掉出當日宇宙時怎麼辦（★ 2026-08-07 自 1111_monthholding 移植）────────
+#   `database/experiment/*/predictions.csv` 只含 in_filter=1 的宇宙（每日約 196 檔
+#   ＝ 全市場流動性前 LIQ_KEEP_RATIO=0.20）。持倉掉出這個集合，本回測就查無分數。
+#
+#   ⚠ **線上 daily 沒有這個缺口**（2026-08-06 查證）：
+#     daily 讀的 `database/daily_predict/final_day_prediction_sort.csv` 是**全池**
+#     （當日 1,092 列，in_filter 只是其中一欄，=1 者 215 檔）。所以
+#       · `select_additions` 用 `in_filter==1` 擋新買入 → 域外股票確實不能買；
+#       · 但 `_resolve_prob` 對域外**持倉**回傳當日真實外推分數，不是 -inf，
+#         照常走 2×std hysteresis（實例：2026-08-05 的 2466，in_filter=0、
+#         rank 261，續抱未賣）；
+#       · -inf 只留給連全池都查無預測的股票（已下市 / 停牌）。
+#     ⟹ 線上行為 = "model"，不是 "sell"。
+#
+#   ★★ 2026-08-07：本檔預設由 "sell" 改為 "model" ★★
+#     本 repo 先前把 -inf 寫死在 prob() 裡（＝"sell"），與線上不符。這造成大量
+#     非自願的強制汰換：日均賣出 3.60 檔 vs "model" 的 3.25 檔、月均成本 4.26%
+#     vs 3.85%。⚠ **本 repo 在此之前的所有回測結論都建立在 "sell" 基準線上，
+#     與改版後的數字不可直接比較。**
+#
+#   宇宙是**每日相對排名**、不是絕對門檻：舊 "sell" 基準線下的 1,423 筆強制汰換，
+#   賣出當日有 90.9% 的 5MA 成交金額仍 > 1 億（＝本系統自己的 MIN_AMOUNT_TO_BUY），
+#   中位數 2.09 億——多半沒有變得不能交易，只是被別人擠出排名。
+#
+#   "model"  ★ 預設 = 線上行為。持倉用**未篩選全市場**的模型分數
+#            （database/experiment_full/predictions_full.csv，由
+#            make_full_predictions_0709.py 產生），連全池都查無 → -inf（同線上，
+#            **不**沿用舊分數）。缺該檔時 load_panel 會印警告並退回 "sell" 口徑。
+#            ⚠ 模型只在流動性前 20% 的樣本上訓練，對域外股票打分是外插到訓練分布
+#              之外——這是線上就存在的性質，不是回測引入的偏誤。
+#   "sell"   掉出宇宙 = prob -inf = 無條件淘汰。舊基準線（誤以為是線上行為）。
+#   "carry"  沿用最後一次有效 pred 繼續當衛冕者，照常走 hysteresis，被擠出才賣。
+#            ⚠ 凍結的是「進場那天的高分」，比實際更難被擠掉 → 這條偏樂觀，是上界。
+#   "liquid" 同 carry，但另加絕對流動性條件：5MA 成交金額 <= MIN_AMOUNT_TO_BUY
+#            才強制賣出。區分「真的不能交易」與「只是被擠出排名」。
+#   ⚠ 改這個值等於改策略假設，不是只改回測。
+OOB_POLICY = "model"
+
 ANNUAL_DAYS       = 252
 MKT_COL           = "market_return_fwd"
 D1_TOP_FRAC       = 0.1          # 對照組 D1（cost0）取宇宙前 10%
 
 NEG_INF = -np.inf
+
+
+# ============================================================
+#  產業分類（供動態換股門檻使用）
+# ============================================================
+# ⚠ database_make/ 沒有產業別欄位，這是用證券代碼前綴推的權宜之計。
+#   對 11xx–29xx 的傳產相當可靠，但 23xx/24xx/30xx–37xx/61xx–69xx/80xx–84xx
+#   一律歸「電子」，其中混有非電子公司；4xxx/5xxx/7xxx/9xxx 歸「其他」，
+#   其中混有電子公司。
+#   ⚠ 不可改用 clu_id_daily：那是每日重編的分群，同一 ID 在連續兩日的成員
+#     Jaccard 中位數為 0.00，跨日沒有身分，不能當產業用。
+#   與 daily/stock_list/trading_config.py::industry_of 保持一致，改一邊要改兩邊。
+
+_INDUSTRY_PREFIX = {
+    11: "水泥", 12: "食品", 13: "塑膠石化", 14: "紡織", 15: "電機機械",
+    16: "電器電纜", 18: "玻璃陶瓷", 19: "造紙", 20: "鋼鐵", 21: "橡膠",
+    22: "汽車", 25: "建材營造", 26: "航運", 27: "觀光", 28: "金融", 29: "貿易百貨",
+}
+
+
+def industry_of(code) -> str:
+    """證券代碼 → 產業別（前綴推定，限制見上方註解）。"""
+    c = str(code).strip()
+    if len(c) != 4 or not c.isdigit():
+        return "其他"                      # 91xxxx 存託憑證等
+    if c == "6505":
+        return "塑膠石化"                   # 台塑化：市值夠大，錯分會歪掉整個電子桶
+    n = int(c)
+    p = n // 100
+    if p in _INDUSTRY_PREFIX:
+        return _INDUSTRY_PREFIX[p]
+    if p == 17:
+        return "化學" if n < 1750 else "生技醫療"
+    if p in (23, 24) or 30 <= p <= 37 or 61 <= p <= 69 or 80 <= p <= 84:
+        return "電子"
+    return "其他"
+
+
+def concentration_prob_mult(held_codes, base_mult: float) -> tuple[float, float]:
+    """依盤前持倉的產業集中度算出當日的換股門檻倍數。
+
+    回傳 (mult, top_share)。CONC_MULT_BETA = 0 或無持倉時回傳 base_mult，
+    與原行為逐位元相同。
+    """
+    codes = list(held_codes or [])
+    if not codes:
+        return base_mult, float("nan")
+    counts: dict[str, int] = {}
+    for c in codes:
+        k = industry_of(c)
+        counts[k] = counts.get(k, 0) + 1
+    top_share = max(counts.values()) / len(codes)
+    if not CONC_MULT_BETA:
+        return base_mult, top_share
+    z = max((top_share - CONC_MULT_MU) / CONC_MULT_SD, 0.0)   # 單邊：低於平均不放鬆
+    return base_mult * (1 + CONC_MULT_BETA * z), top_share
 
 
 # ============================================================
@@ -284,7 +420,10 @@ def load_panel(preds: pd.DataFrame, db_make_dir: Path) -> tuple[Panel, dict]:
     same[1:] = (close[1:] == close[:-1]) & (amount[1:] == amount[:-1])
     same_df = pd.DataFrame(same.astype(float))
     # 連續 STALE_WINDOW-1 次「與前一日相同」⟺ 視窗內 STALE_WINDOW 列逐字相同
-    stale = (same_df.rolling(STALE_WINDOW - 1, min_periods=STALE_WINDOW - 1).min() == 1).to_numpy()
+    # ★ 2026-08-07：.copy() 不可省。pandas 3.0 的 copy-on-write 讓 to_numpy() 回唯讀
+    #   陣列，下一行的 `stale &=` 會炸 ValueError: output array is read-only。
+    #   （此為既有缺陷，與集中度門檻無關；1111_monthholding 已於 08-06 修過同一處。）
+    stale = (same_df.rolling(STALE_WINDOW - 1, min_periods=STALE_WINDOW - 1).min() == 1).to_numpy().copy()
     stale &= np.isfinite(close)          # 全 NaN 的空窗不算凍結（會被其他濾網擋掉）
 
     # ── 估得出張數？（漲停價 × 手續費，1 張成本 <= 上限）
@@ -319,11 +458,42 @@ def load_panel(preds: pd.DataFrame, db_make_dir: Path) -> tuple[Panel, dict]:
     )
     arrays["pred"] = pred_wide.to_numpy(dtype=float)
 
+    # ── 全市場預測矩陣（OOB_POLICY="model" 的衛冕者分數來源）───────────────
+    arrays["pred_full"] = load_full_pred_matrix(panel)
+    if arrays["pred_full"] is None:
+        if OOB_POLICY == "model":
+            print(f"  [WARN] OOB_POLICY='model' 但找不到 {FULL_PRED_PATH}"
+                  f"\n         → 域外持倉將退回 -inf（＝'sell' 口徑），與線上不一致。"
+                  f"\n         先執行 make_full_predictions_0709.py 產生該檔。")
+    else:
+        _gap = (~np.isfinite(arrays["pred"])) & np.isfinite(arrays["pred_full"])
+        print(f"  全市場預測：補上 {int(_gap.sum()):,} 格宇宙外的分數"
+              f"（宇宙內 {int(np.isfinite(arrays['pred']).sum()):,} 格維持原值不動）")
+
     print(f"\n  面板：{panel.shape[0]} 個交易日 × {panel.shape[1]} 檔  "
           f"（{panel.dates[0].date()} ~ {panel.dates[-1].date()}）")
     print(f"  行情凍結格數：{int(arrays['stale'].sum()):,}  "
           f"（其中在當日宇宙內：{int((arrays['stale'] & np.isfinite(arrays['pred'])).sum()):,}）")
     return panel, arrays
+
+
+def load_full_pred_matrix(panel: "Panel") -> np.ndarray | None:
+    """讀 predictions_full.csv → 與 panel 對齊的 pred 矩陣；沒有該檔回 None。
+
+    ⚠ 這份矩陣**不會**併進 arrays["pred"]，而是以 arrays["pred_full"] 分開放，
+      只給衛冕者用（見 simulate 的說明）。原因：`pred` 同時決定 `in_universe`
+      → 候選池與 prob_std（換股門檻）。把全市場分數併進 pred 會順便放行「買進
+      宇宙外的股票」，那是另一個實驗，而且線上 daily 明確用 in_filter==1 擋掉了。
+      實際踩過：併進去的版本換手率從 0.361 暴增到 0.477、年化掉到 43.9%。
+    """
+    if not FULL_PRED_PATH.exists():
+        return None
+    df = pd.read_csv(FULL_PRED_PATH, dtype={"證券代碼": str}, encoding="utf-8-sig")
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL])
+    df["證券代碼"] = df["證券代碼"].str.strip()
+    wide = (df.pivot_table(index=DATE_COL, columns="證券代碼", values="y_pred", aggfunc="first")
+              .reindex(index=panel.dates, columns=panel.codes))
+    return wide.to_numpy(dtype=float)
 
 
 # ============================================================
@@ -334,6 +504,10 @@ def simulate(panel: Panel, A: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.Data
     """逐日跑 daily 的下單規則，回傳 (每日彙總, 持倉明細, 交易明細, 濾網統計)。"""
     pred, ret, chg, amt5 = A["pred"], A["ret"], A["chg"], A["amt5"]
     stale, units_ok, clu = A["stale"], A["units_ok"], A["clu"]
+    # OOB_POLICY="model" 專用：未篩選全市場的模型分數。
+    # ⚠ **只給衛冕者用**，不併進 pred。pred 同時決定 in_universe → 候選池與
+    #   prob_std（換股門檻），把全市場分數併進去等於順便放行買進宇宙外的股票。
+    pred_full = A.get("pred_full")
 
     n_days, _ = panel.shape
     codes = np.array(panel.codes)
@@ -341,6 +515,10 @@ def simulate(panel: Panel, A: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.Data
     held: list[int] = []          # 目前持倉（欄位索引）
     daily_rows, holding_rows, trade_rows, filter_rows = [], [], [], []
     nan_ret_count = 0
+    # OOB_POLICY != "sell" 時用來沿用「最後一次有效 pred」。買進當天必定在宇宙內，
+    # 所以新持倉一定先寫進這裡；賣出時清掉，避免下次買回沿用到上一段的舊分數。
+    last_pred: dict[int, float] = {}
+    oob_kept_days = 0             # 靠 policy 續命的持倉日數（診斷用）
 
     for i in range(n_days):
         date = panel.dates[i]
@@ -364,18 +542,63 @@ def simulate(panel: Panel, A: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.Data
         cand = [c for c in np.flatnonzero(elig) if c not in held_set]
         cand.sort(key=lambda c: -p[c])           # rank 順序 ＝ 預測值由高到低
 
+        # ── 持倉的有效 pred（OOB_POLICY，見檔案上方設定區）─────────────────
+        for c in held:
+            if np.isfinite(p[c]):
+                last_pred[c] = p[c]
+
         def prob(c: int) -> float:
-            """查無預測（掉出當日宇宙）→ -inf，優先淘汰（daily::_resolve_prob）。"""
-            return p[c] if np.isfinite(p[c]) else NEG_INF
+            """查無預測（掉出當日宇宙）時的分數，決定它會不會被無條件淘汰。
+
+            "model"（預設 = 線上 daily::_resolve_prob）→ 全市場當日真實分數；
+                    連全市場都查無（已下市 / 停牌）→ -inf。**不**沿用舊分數，
+                    因為線上讀的是全池預測檔，沒有「沿用」這回事。
+            "sell"  → -inf，排最前面優先淘汰（舊基準線）。
+            "carry" / "liquid" → 沿用最後一次有效 pred，照常跟挑戰者比 2×std。
+            """
+            if np.isfinite(p[c]):
+                return p[c]
+            if OOB_POLICY == "model":
+                if pred_full is not None and np.isfinite(pred_full[i, c]):
+                    return float(pred_full[i, c])  # 當日真實分數（全市場打分）
+                return NEG_INF
+            if OOB_POLICY != "sell":
+                v = last_pred.get(c)               # 退路：沿用最後一次有效 pred
+                if v is not None:
+                    return v
+            return NEG_INF
 
         # ── 強制賣出：行情凍結的持倉（不走 prob 門檻）───────────────────
         stale_held = [c for c in held if ENABLE_STALE_FILTER and stale[i, c]]
-        removed = list(stale_held)
+        forced = list(stale_held)
+
+        # ── 強制賣出：掉出宇宙且**絕對**流動性不足（只有 "liquid" 會走這條）──
+        #   區分「真的不能交易」與「只是被別人擠出前 20% 排名」。
+        if OOB_POLICY == "liquid":
+            _fset = set(forced)
+            for c in held:
+                if c in _fset or np.isfinite(p[c]):
+                    continue
+                if not (np.nan_to_num(amt5[i, c], nan=0.0) > MIN_AMOUNT_TO_BUY):
+                    forced.append(c)
+
+        if OOB_POLICY != "sell":
+            fset = set(forced)
+            oob_kept_days += sum(
+                1 for c in held
+                if not np.isfinite(p[c]) and c not in fset and np.isfinite(prob(c))
+            )
+
+        removed = list(forced)
 
         # ── 換股：prob hysteresis ────────────────────────────────────────
         universe_pred = p[in_universe]
         prob_std = float(np.std(universe_pred, ddof=0)) if universe_pred.size >= 2 else 0.0
-        threshold = PROB_STD_MULT * prob_std
+        # 產業集中度 → 動態門檻。用「盤前」持倉 held（含即將強制賣出者），
+        # 與 daily/recorder.py 的 old_df 同口徑；拿換股後的持倉算等於用未來資訊。
+        prob_mult, top_share = concentration_prob_mult(
+            [codes[c] for c in held], PROB_STD_MULT)
+        threshold = prob_mult * prob_std
 
         if ENABLE_HYSTERESIS:
             incumbents = sorted((c for c in held if c not in set(stale_held)), key=prob)
@@ -472,6 +695,8 @@ def simulate(panel: Panel, A: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.Data
             "n_universe":  int(in_universe.sum()),
             "n_eligible":  int(elig.sum()),
             "prob_std":    prob_std,
+            "conc_top":    top_share,     # 盤前持倉最大產業佔比
+            "prob_mult":   prob_mult,     # 當日實際採用的換股門檻倍數
         })
 
         for c in held:
@@ -614,6 +839,8 @@ def main():
     print(f"  持倉檔數        : {TARGET_N}")
     print(f"  換股門檻        : {PROB_STD_MULT} × std(pred_score)"
           f"{'' if ENABLE_HYSTERESIS else '  ← 已關閉（每日重排）'}")
+    print(f"  集中度動態門檻  : β={CONC_MULT_BETA}"
+          f"{f'（mu={CONC_MULT_MU} sd={CONC_MULT_SD}，單邊）' if CONC_MULT_BETA else '  ← 已停用'}")
     print(f"  成本            : 買 {BUY_COST_RATE:.4%} / 賣 {SELL_COST_RATE:.4%}"
           f"（來回 {BUY_COST_RATE + SELL_COST_RATE:.4%}）")
     print(f"  濾網            : 金額>{MIN_AMOUNT_TO_BUY / 1e8:.0f}億={ENABLE_AMOUNT_FILTER} "
@@ -678,6 +905,8 @@ def main():
 
     run_config = {
         "TARGET_N": TARGET_N, "PROB_STD_MULT": PROB_STD_MULT, "CLUSTER_CAP": CLUSTER_CAP,
+        "CONC_MULT_BETA": CONC_MULT_BETA, "CONC_MULT_MU": CONC_MULT_MU,
+        "CONC_MULT_SD": CONC_MULT_SD,
         "MAX_CHG_TO_BUY": MAX_CHG_TO_BUY, "MIN_AMOUNT_TO_BUY": MIN_AMOUNT_TO_BUY,
         "AMOUNT_MA_DAYS": AMOUNT_MA_DAYS, "STALE_WINDOW": STALE_WINDOW,
         "MIN_PRED_SCORE": MIN_PRED_SCORE, "BUY_MAX_AMOUNT": BUY_MAX_AMOUNT,
