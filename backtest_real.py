@@ -94,7 +94,7 @@ backtest_real.py
     annual_returns.png       逐年報酬（淨 vs 大盤 vs D1 cost0）
     holdings_turnover.png    持倉檔數與換手率時序（看濾網何時咬得最兇）
     monthly_vs_market.png    每月超額報酬（bar + 年×月熱圖），口徑同 backtest_0709
-    monthly_distribution.png 月報酬／月超額的分布 vs 常態分配（含偏度、峰度、JB 檢定）
+    monthly_distribution.png 月超額報酬分布 vs 常態（算術超額／幾何相對，兩張皆扣大盤）
     yearly/<年>.png          一年一張：年內累積報酬 / 單邊換手率 / 年化波動度
     run_config.json          本次跑的完整設定（可重現）
 
@@ -1104,8 +1104,11 @@ def main():
     if not monthly.empty:
         monthly.to_csv(OUTPUT_DIR / "monthly_returns.csv", encoding="utf-8-sig")
         print(f"  ✓ monthly_returns.csv（{len(monthly)} 個月）")
+    # 左＝紙上 D1 的毛報酬（零成本、每日重排），右＝實單淨值。兩張都扣掉大盤，
+    # 所以並排的差就是可交易性約束＋成本吃掉的那一塊。
     plot_monthly_distribution(ret_df, OUTPUT_DIR,
-                              strat_col="net", strat_label="實單淨值")
+                              series=[("D1_cost0", "紙上 D1 毛報酬（cost0）"),
+                                      ("net", "實單淨值（含成本）")])
 
     print("\n" + "=" * 70)
     print("  績效指標")

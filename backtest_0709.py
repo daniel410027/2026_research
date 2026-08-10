@@ -767,33 +767,55 @@ def plot_monthly_vs_market(ret_df: pd.DataFrame, output_dir: Path,
 
 
 def plot_monthly_distribution(ret_df: pd.DataFrame, output_dir: Path,
+                              series: list[tuple[str, str]] | None = None,
                               strat_col: str = "D1",
                               strat_label: str = "D1") -> pd.DataFrame:
-    """月報酬分布 vs 常態：左＝策略月報酬，右＝月超額報酬。
+    """月**超額**報酬分布 vs 常態：一個 panel 一條策略序列，**皆已扣掉大盤**。
 
-    （2026-08-10 自 ~/Desktop/1201_monthfeatrue/backtest_0709.py 移植，行為相同。）
+    （2026-08-10 自 ~/Desktop/1201_monthfeatrue/backtest_0709.py 移植；
+      同日依使用者要求改為全部扣掉大盤——原版左邊畫的是含大盤漲跌的月報酬，
+      那條混進了 beta，看不出「這個策略自己贏多少」。）
+
+    `series` 是 [(欄名, 顯示名), ...]，未給就退回單一 `strat_col`。
+    backtest_real 傳兩條：
+        左 D1_cost0  紙上 D1 的毛報酬（每日重排、零成本）
+        右 net       實單淨值（含成本、含可交易性約束）
+    兩張都是「該序列的月報酬 − 大盤月報酬」，所以並排看到的差就是
+    **可交易性約束＋交易成本吃掉的那一塊**，與 cumulative_returns.png 上
+    灰線與紅線的距離是同一件事，只是換成逐月的分布來看形狀：
+    平均差多少、尾部是不是被削掉、大賺月有沒有被成本吃成平庸月。
 
     每個 panel：直方圖（機率密度）＋ 同均數同標準差的常態曲線（虛線）。
     疊常態曲線是為了讓「偏離常態」看得見，不是假設它常態：
-      右尾高於曲線 ＝ 大賺月比常態多；左尾高於曲線 ＝ 大賠月比常態多（尾部風險）
+      右尾高於曲線 ＝ 大贏月比常態多；左尾高於曲線 ＝ 大輸月比常態多（尾部風險）
       峰度 > 0     ＝ 中央更尖、尾巴更厚 → 用常態算的 VaR 會低估風險
     Jarque–Bera p < 0.05 就是統計上拒絕常態；月樣本數通常只有百來個，
     這個檢定的力量有限，所以圖上同時給偏度與超峰度的點估計，別只看 p。
     """
     from scipy import stats
 
-    m = monthly_table(ret_df, strat_col)
+    if series is None:
+        series = [(strat_col, strat_label)]
+    series = [(c, lab) for c, lab in series if c in ret_df.columns]
+    if not series:
+        print("  ⚠ 指定的欄位都不在 ret_df，跳過 monthly_distribution.png")
+        return pd.DataFrame()
+
+    # 每條序列各自跟大盤算月超額。回傳的是**第一條**的月表（習慣上是主序列），
+    # 與 plot_monthly_vs_market 的回傳保持同型。
+    tables = [(monthly_table(ret_df, c), lab) for c, lab in series]
+    m = tables[0][0]
     if len(m) < 12:
         print("  ⚠ 月報酬樣本不足（< 12 個月），跳過 monthly_distribution.png")
         return m
 
-    # 左右兩個 panel 是不同的量，不是同一條線的兩種畫法：左邊含大盤漲跌，
-    # 右邊已把大盤扣掉。同一個月在左邊可能 −34%、在右邊只有 −20%（大盤自己跌 −14%），
-    # 標題必須講明，否則會被讀成「同一個數字兩張圖對不起來」。
-    panels = [(m["d1"].values,     f"{strat_label} 月報酬（含大盤漲跌，未扣大盤）", C_POS),
-              (m["excess"].values, f"月超額報酬（{strat_label} − 大盤，即 monthly_vs_market 那張的量）", C_NEG)]
+    _COLORS = [C_POS, C_NEG, C_UNIV, C_LS]
+    panels = [(t["excess"].values, f"{lab} − 大盤", _COLORS[i % len(_COLORS)])
+              for i, (t, lab) in enumerate(tables)]
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5.6))
+    fig, axes = plt.subplots(1, len(panels), figsize=(7 * len(panels), 5.6),
+                             squeeze=False)
+    axes = axes.ravel()
     for ax, (v, title, color) in zip(axes, panels):
         mu, sd = float(v.mean()), float(v.std(ddof=1))
         # bin 數：Freedman–Diaconis 的 2 倍（下限 24 格）。FD 的原始格數在 100
@@ -816,7 +838,7 @@ def plot_monthly_distribution(ret_df: pd.DataFrame, output_dir: Path,
         pos = int((v > 0).sum())
         ax.text(0.02, 0.97,
                 f"n = {len(v)}\n"
-                f"> 0 的月份 {pos}/{len(v)} = {pos / len(v):.0%}\n"
+                f"贏大盤的月份 {pos}/{len(v)} = {pos / len(v):.0%}\n"
                 f"（常態下應為 {stats.norm.cdf(mu / sd):.0%}）\n"
                 f"偏度 {sk:+.2f}\n"
                 f"超峰度 {ku:+.2f}\n"
@@ -829,7 +851,7 @@ def plot_monthly_distribution(ret_df: pd.DataFrame, output_dir: Path,
                           edgecolor=C_REF, alpha=0.85, linewidth=0.6))
 
         ax.set_title(title, fontsize=10.5, color=C_INK, pad=8)
-        ax.set_xlabel("月報酬", fontsize=9, color=C_INK2)
+        ax.set_xlabel("月超額報酬", fontsize=9, color=C_INK2)
         ax.set_ylabel("機率密度", fontsize=9, color=C_INK2)
         ax.xaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
         ax.grid(axis="y", color=C_REF, alpha=0.18, linewidth=0.7)
@@ -839,7 +861,8 @@ def plot_monthly_distribution(ret_df: pd.DataFrame, output_dir: Path,
         ax.tick_params(colors=C_INK2, labelsize=9)
         ax.legend(fontsize=8.5, frameon=False, loc="upper right")
 
-    fig.suptitle(f"{strat_label} 月報酬分布 vs 常態分配（{m.index[0]:%Y-%m} ~ {m.index[-1]:%Y-%m}）",
+    fig.suptitle("月超額報酬分布 vs 常態分配"
+                 f"（皆為「該序列 − 大盤」；{m.index[0]:%Y-%m} ~ {m.index[-1]:%Y-%m}）",
                  fontsize=13, color=C_INK)
     plt.tight_layout()
     fig.savefig(output_dir / "monthly_distribution.png", dpi=150,
