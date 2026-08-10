@@ -368,6 +368,15 @@ def daily_returns(
     if "D1" in ret.columns:
         ret["excess_D1"] = ret["D1"] - ret["market"]
 
+    # ★ 多空對沖：多 D1 50% + 空 D_last 50%（市值中性，總曝險 100%）
+    #   減 cost×capital_usage 的理由：上面 ret 已經對每組扣過 cost，做差時
+    #   多腳的 −cost 會被空腳的 +cost 抵銷掉，等於把成本加回來。空腳一樣要付
+    #   手續費，所以要把整組的成本補回去一次。COST_BPS=0 時此項為 0。
+    d_cols = [c for c in ret.columns if c.startswith("D") and c[1:].isdigit()]
+    if "D1" in d_cols and len(d_cols) > 1:
+        d_last = max(d_cols, key=lambda c: int(c[1:]))
+        ret["LS"] = 0.5 * ret["D1"] - 0.5 * ret[d_last] - cost * capital_usage
+
     return ret
 
 
@@ -440,6 +449,7 @@ COLORS = plt.cm.RdYlGn(np.linspace(0.15, 0.85, N_DECILES))
 # ⚠ 不要換成紅綠配——那是色盲讀者最分不出來的一組，而既有的 RdYlGn 十分位色帶
 #   已經有這個問題（那是舊圖，未在本次範圍內處理）。
 C_STRAT = "#2a78d6"   # D1（策略）
+C_LS    = "#e08214"   # 多空對沖（50% D1 − 50% D_last）；與 C_STRAT/灰在三種色盲下 ΔE≥14.8
 C_UNIV  = "#eb6834"   # 等權宇宙
 C_POS   = "#2a78d6"   # 月超額 > 0（贏大盤）
 C_NEG   = "#d1344a"   # 月超額 < 0（輸大盤）
@@ -467,8 +477,8 @@ def universe_ew_returns(df: pd.DataFrame, capital_usage: float = 1.0) -> pd.Seri
 
 
 def plot_cumulative(ret_df: pd.DataFrame, output_dir: Path):
-    """10 組累積報酬 + 大盤基準線 + excess_D1（同一左軸 log10 NAV）。"""
-    decile_cols = [c for c in ret_df.columns if c.startswith("D") and c not in ("excess_D1",)]
+    """10 組累積報酬 + 大盤基準線 + excess_D1 + 多空對沖（同一左軸 log10 NAV）。"""
+    decile_cols = [c for c in ret_df.columns if c.startswith("D") and c[1:].isdigit()]
     fig, ax = plt.subplots(figsize=(13, 6))
 
     for i, col in enumerate(decile_cols):
@@ -486,6 +496,12 @@ def plot_cumulative(ret_df: pd.DataFrame, output_dir: Path):
         exc_cum = (1 + ret_df["excess_D1"].fillna(0)).cumprod()
         ax.plot(exc_cum.index, np.log10(exc_cum.values),
                 label="Excess D1", color="#7b2d8b", linewidth=1.8, linestyle="-.")
+
+    if "LS" in ret_df.columns:
+        ls_cum = (1 + ret_df["LS"].fillna(0)).cumprod()
+        ax.plot(ls_cum.index, np.log10(ls_cum.values),
+                label=f"L/S (50% D1 − 50% D{N_DECILES})", color=C_LS,
+                linewidth=2.0, linestyle="-")
 
     ax.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%d"))
@@ -574,33 +590,45 @@ def plot_decile_summary(metrics_df: pd.DataFrame, output_dir: Path):
 
 
 def plot_annual_decile1(ret_df: pd.DataFrame, output_dir: Path):
-    """Decile 1 各年度報酬長條圖，附大盤同期報酬對照點。"""
-    d1 = ret_df["D1"].dropna()
-    annual_d1 = d1.groupby(d1.index.year).apply(lambda r: (1 + r).prod() - 1)
+    """Decile 1 與多空對沖各年度報酬長條圖，附大盤同期報酬對照點。"""
+    annual = lambda s: s.dropna().groupby(s.dropna().index.year).apply(
+        lambda r: (1 + r).prod() - 1)
+    annual_d1 = annual(ret_df["D1"])
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    colors = ["#d7191c" if v < 0 else "#2c7bb6" for v in annual_d1.values]
-    bars = ax.bar(annual_d1.index.astype(str), annual_d1.values,
-                  color=colors, edgecolor="none", alpha=0.85)
+    # D1 用「正藍負紅」的極性上色（單一序列，色彩表達正負）；
+    # L/S 是另一個身分（categorical），所以吃固定色不隨正負變。
+    series = [("D1", annual_d1, ["#d7191c" if v < 0 else "#2c7bb6" for v in annual_d1.values])]
+    if "LS" in ret_df.columns:
+        annual_ls = annual(ret_df["LS"]).reindex(annual_d1.index)
+        series.append((f"L/S (50% D1 − 50% D{N_DECILES})", annual_ls, C_LS))
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    x = np.arange(len(annual_d1)); width = 0.8 / len(series)
+    for k, (label, vals, color) in enumerate(series):
+        bars = ax.bar(x + k * width, vals.values, width, label=label,
+                      color=color, edgecolor="none", alpha=0.85)
+        for bar, val in zip(bars, vals.values):
+            if np.isnan(val):
+                continue
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.005 * np.sign(val + 1e-9),
+                    f"{val:.1%}", ha="center",
+                    va="bottom" if val >= 0 else "top", fontsize=7.5)
+    ax.set_xticks(x + width * (len(series) - 1) / 2)
+    ax.set_xticklabels(annual_d1.index.astype(str))
 
     # 大盤年度對照
     if "market" in ret_df.columns:
-        mkt = ret_df["market"].dropna()
-        annual_mkt = mkt.groupby(mkt.index.year).apply(lambda r: (1 + r).prod() - 1)
-        common_years = annual_d1.index.intersection(annual_mkt.index)
-        ax.plot(common_years.astype(str), annual_mkt.loc[common_years].values,
+        annual_mkt = annual(ret_df["market"]).reindex(annual_d1.index)
+        ax.plot(x + width * (len(series) - 1) / 2, annual_mkt.values,
                 "o--", color="black", linewidth=1.2, markersize=6, label="Market", zorder=5)
-        ax.legend(fontsize=9)
+    ax.legend(fontsize=9)
 
     ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=1))
     cap_label = f" (Capital {CAPITAL_USAGE:.0%})" if CAPITAL_USAGE < 1 else ""
-    ax.set_title(f"Decile 1 – Annual Return{cap_label}", fontsize=12)
+    ax.set_title(f"Decile 1 vs L/S – Annual Return{cap_label}", fontsize=12)
     ax.axhline(0, color="black", linewidth=0.8)
     ax.spines[["top", "right"]].set_visible(False)
-    for bar, val in zip(bars, annual_d1.values):
-        ax.text(bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 0.005 * np.sign(val + 1e-9),
-                f"{val:.1%}", ha="center", va="bottom", fontsize=9)
     plt.tight_layout()
     fig.savefig(output_dir / "annual_decile1.png", dpi=150)
     plt.close(fig)
@@ -735,6 +763,89 @@ def plot_monthly_vs_market(ret_df: pd.DataFrame, output_dir: Path,
                 facecolor="white", bbox_inches="tight")
     plt.close(fig)
     print("  ✓ monthly_vs_market.png")
+    return m
+
+
+def plot_monthly_distribution(ret_df: pd.DataFrame, output_dir: Path,
+                              strat_col: str = "D1",
+                              strat_label: str = "D1") -> pd.DataFrame:
+    """月報酬分布 vs 常態：左＝策略月報酬，右＝月超額報酬。
+
+    （2026-08-10 自 ~/Desktop/1201_monthfeatrue/backtest_0709.py 移植，行為相同。）
+
+    每個 panel：直方圖（機率密度）＋ 同均數同標準差的常態曲線（虛線）。
+    疊常態曲線是為了讓「偏離常態」看得見，不是假設它常態：
+      右尾高於曲線 ＝ 大賺月比常態多；左尾高於曲線 ＝ 大賠月比常態多（尾部風險）
+      峰度 > 0     ＝ 中央更尖、尾巴更厚 → 用常態算的 VaR 會低估風險
+    Jarque–Bera p < 0.05 就是統計上拒絕常態；月樣本數通常只有百來個，
+    這個檢定的力量有限，所以圖上同時給偏度與超峰度的點估計，別只看 p。
+    """
+    from scipy import stats
+
+    m = monthly_table(ret_df, strat_col)
+    if len(m) < 12:
+        print("  ⚠ 月報酬樣本不足（< 12 個月），跳過 monthly_distribution.png")
+        return m
+
+    # 左右兩個 panel 是不同的量，不是同一條線的兩種畫法：左邊含大盤漲跌，
+    # 右邊已把大盤扣掉。同一個月在左邊可能 −34%、在右邊只有 −20%（大盤自己跌 −14%），
+    # 標題必須講明，否則會被讀成「同一個數字兩張圖對不起來」。
+    panels = [(m["d1"].values,     f"{strat_label} 月報酬（含大盤漲跌，未扣大盤）", C_POS),
+              (m["excess"].values, f"月超額報酬（{strat_label} − 大盤，即 monthly_vs_market 那張的量）", C_NEG)]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.6))
+    for ax, (v, title, color) in zip(axes, panels):
+        mu, sd = float(v.mean()), float(v.std(ddof=1))
+        # bin 數：Freedman–Diaconis 的 2 倍（下限 24 格）。FD 的原始格數在 100
+        # 個月的樣本上只有十來格，形狀被抹平成一個梯形；加密到 24+ 格才看得到
+        # 雙峰／缺口／尾部那幾個孤立月。格內平均 4 筆左右，還不到純噪音的程度。
+        nb = (np.histogram_bin_edges(v, bins="auto").size - 1) * 2
+        ax.hist(v, bins=max(nb, 24), density=True, color=color, alpha=0.55,
+                edgecolor="white", linewidth=0.5)
+
+        xs = np.linspace(v.min() - 1.5 * sd, v.max() + 1.5 * sd, 400)
+        ax.plot(xs, stats.norm.pdf(xs, mu, sd), color=C_INK, linewidth=1.4,
+                linestyle="--", label=f"常態 N({mu:.2%}, {sd:.2%}²)")
+        ax.axvline(0, color=C_REF, linewidth=0.9)
+        ax.axvline(mu, color=color, linewidth=1.4,
+                   label=f"平均 {mu:+.2%}（中位 {np.median(v):+.2%}）")
+
+        sk = float(stats.skew(v))
+        ku = float(stats.kurtosis(v))            # Fisher：常態 = 0
+        jb_p = float(stats.jarque_bera(v).pvalue)
+        pos = int((v > 0).sum())
+        ax.text(0.02, 0.97,
+                f"n = {len(v)}\n"
+                f"> 0 的月份 {pos}/{len(v)} = {pos / len(v):.0%}\n"
+                f"（常態下應為 {stats.norm.cdf(mu / sd):.0%}）\n"
+                f"偏度 {sk:+.2f}\n"
+                f"超峰度 {ku:+.2f}\n"
+                f"JB p = {jb_p:.3f}"
+                f"{'（拒絕常態）' if jb_p < 0.05 else '（不拒絕常態）'}\n"
+                f"最好 {v.max():+.1%}　最差 {v.min():+.1%}",
+                transform=ax.transAxes, va="top", ha="left",
+                fontsize=8.5, color=C_INK2,
+                bbox=dict(boxstyle="round,pad=0.45", facecolor="white",
+                          edgecolor=C_REF, alpha=0.85, linewidth=0.6))
+
+        ax.set_title(title, fontsize=10.5, color=C_INK, pad=8)
+        ax.set_xlabel("月報酬", fontsize=9, color=C_INK2)
+        ax.set_ylabel("機率密度", fontsize=9, color=C_INK2)
+        ax.xaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
+        ax.grid(axis="y", color=C_REF, alpha=0.18, linewidth=0.7)
+        ax.set_axisbelow(True)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.spines[["left", "bottom"]].set_color(C_REF)
+        ax.tick_params(colors=C_INK2, labelsize=9)
+        ax.legend(fontsize=8.5, frameon=False, loc="upper right")
+
+    fig.suptitle(f"{strat_label} 月報酬分布 vs 常態分配（{m.index[0]:%Y-%m} ~ {m.index[-1]:%Y-%m}）",
+                 fontsize=13, color=C_INK)
+    plt.tight_layout()
+    fig.savefig(output_dir / "monthly_distribution.png", dpi=150,
+                facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    print("  ✓ monthly_distribution.png")
     return m
 
 
@@ -1079,6 +1190,7 @@ def main():
     if not monthly.empty:
         monthly.to_csv(OUTPUT_DIR / "monthly_returns.csv", encoding="utf-8-sig")
         print(f"  ✓ monthly_returns.csv（{len(monthly)} 個月）")
+    plot_monthly_distribution(ret_df, OUTPUT_DIR)
     plot_drawdown_vs_universe(ret_df, OUTPUT_DIR)
     episodes = plot_excess_drawdown(ret_df, OUTPUT_DIR)
 

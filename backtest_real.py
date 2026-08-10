@@ -94,6 +94,7 @@ backtest_real.py
     annual_returns.png       逐年報酬（淨 vs 大盤 vs D1 cost0）
     holdings_turnover.png    持倉檔數與換手率時序（看濾網何時咬得最兇）
     monthly_vs_market.png    每月超額報酬（bar + 年×月熱圖），口徑同 backtest_0709
+    monthly_distribution.png 月報酬／月超額的分布 vs 常態分配（含偏度、峰度、JB 檢定）
     yearly/<年>.png          一年一張：年內累積報酬 / 單邊換手率 / 年化波動度
     run_config.json          本次跑的完整設定（可重現）
 
@@ -121,6 +122,7 @@ from backtest_0709 import (
     load_market_return,
     calc_metrics,
     plot_monthly_vs_market,
+    plot_monthly_distribution,
     DATE_COL,
 )
 
@@ -139,6 +141,12 @@ FULL_PRED_PATH    = _ROOT / "database" / "experiment_full" / "predictions_full.c
 
 # ── 組合規則（對應 daily/stock_list/order_recorder/recorder_config.py）──────
 TARGET_N          = 10       # 目標持倉檔數
+# ★ 2026-08-10：此處**維持 2.0 當基準**，線上（daily）是 2.5。這是刻意的分歧。
+#   理由：改常數會讓 summary_research.md 引用過的所有舊數字一次失效，且無法再與
+#   舊表同基準比較。改用 1201_monthfeatrue 的做法——本檔不動，變體由
+#   `backtest_real_variants.py` 覆寫模組全域後跑，輸出另存，兩份同時存在。
+#     線上對齊版（2.5 + MIN_PRED_SCORE 0.0040）：python backtest_real_variants.py online
+#   ⚠ 對外引用任何 backtest_real 數字都要標明門檻值，2.0 與 2.5 的輸出不可混用。
 PROB_STD_MULT     = 2.0      # 換股門檻：挑戰者需高出衛冕者 N × std(pred_score)
 CLUSTER_CAP       = 2        # 同一 clu_id_daily 最多持有幾檔
 
@@ -176,8 +184,8 @@ CLUSTER_CAP       = 2        # 同一 clu_id_daily 最多持有幾檔
 # 對其不敏感（mu 0.60/0.65/0.70 → Sharpe 1.47/1.45/1.47）。固定常數版與擴張窗口版
 # 結果幾乎相同（年化 55.54% vs 55.19%，Sharpe 皆 1.45）。
 #
-# 線上對應：daily/stock_list/trading_config.py::concentration_prob_mult
-# （該處預設 CONC_MULT_BETA = 0.0 停用，需人工決定何時開啟）
+# 線上對應：daily/stock_list/concentration.py::concentration_prob_mult
+# （線上 2026-08-07 已啟用 β = 0.20，與此處一致）
 CONC_MULT_BETA    = 0.20     # 0 = 停用（回到原本的固定 PROB_STD_MULT）
 CONC_MULT_MU      = 0.65     # 持倉最大產業佔比的長期平均
 CONC_MULT_SD      = 0.18     # 同上的標準差
@@ -212,6 +220,13 @@ MAX_CHG_TO_BUY    = 0.07         # 當日漲幅上限（追高 / 漲停買不到
 MIN_AMOUNT_TO_BUY = 100_000_000  # 5MA 成交金額下限（元）＝公司版一億
 AMOUNT_MA_DAYS    = 5            # 成交金額移動平均天數
 STALE_WINDOW      = 5            # 行情凍結判定視窗（交易日）
+# ★ 線上 recorder_config.py 是 0.0040（2026-08-05 改的），本檔基準維持 0.0。
+#   出處：~/Desktop/1110_calibration/calibration_summary.md §7.5 E1 / §九。
+#   校準式 E[return] ≈ 0.751 × pred_score + 5.3 bps；40 bps 落在 30–50 的平台中央。
+#   ⚠ 報酬提升不顯著（t = 1.51, p ≈ 0.13）；站得住的是降回撤與降成本。
+#   此處**維持 0.0 當基準**，變體走 `backtest_real_variants.py score40`，不改本檔。
+#   只作用於「新買入」（cand 建在 elig 上、不含此濾網 → 不影響 hysteresis 挑戰者池），
+#   與線上 recorder.py::_pick_with_constraints 同口徑。
 MIN_PRED_SCORE    = 0.0          # 新買入的預測值下限（負期望值不買）
 
 # ── 張數估算（對應 daily/order_recorder/sizing.py::calc_units）─────────────
@@ -735,7 +750,8 @@ def simulate(panel: Panel, A: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.Data
 # ============================================================
 
 def reference_series(preds: pd.DataFrame) -> pd.DataFrame:
-    """算兩條零成本對照：宇宙等權，以及 backtest_0709 口徑的 D1（前 10%）。
+    """算零成本對照：宇宙等權、backtest_0709 口徑的 D1（前 10%）、
+    末組 D10（後 10%），以及多空對沖 LS = 50% D1 − 50% D10。
 
     D1 用來量「可交易性約束吃掉多少」：同一份預測值，
     一邊是每日重排的紙上組合，一邊是 daily 真的會下的單。
@@ -743,11 +759,17 @@ def reference_series(preds: pd.DataFrame) -> pd.DataFrame:
     df = preds.copy()
     df["_rank"] = df.groupby(DATE_COL)["y_pred"].rank(method="first", ascending=False)
     df["_size"] = df.groupby(DATE_COL)["y_pred"].transform("count")
-    top = df[df["_rank"] <= np.ceil(df["_size"] * D1_TOP_FRAC)]
+    n_tail = np.ceil(df["_size"] * D1_TOP_FRAC)
+    top = df[df["_rank"] <= n_tail]
+    bot = df[df["_rank"] > df["_size"] - n_tail]
     out = pd.DataFrame({
         "universe_ew": df.groupby(DATE_COL)["return"].mean(),
         "D1_cost0":    top.groupby(DATE_COL)["return"].mean(),
+        "D10_cost0":   bot.groupby(DATE_COL)["return"].mean(),
     }).sort_index()
+    # 多空對沖：多 D1 50% + 空 D10 50%。這裡是 cost0 口徑（跟 D1_cost0 一致），
+    # 沒扣手續費也沒算借券成本／可借券性——實務上空腳是最難落地的一段。
+    out["LS_cost0"] = 0.5 * out["D1_cost0"] - 0.5 * out["D10_cost0"]
     return out
 
 
@@ -759,6 +781,7 @@ _SERIES_STYLE = {
     "net":         ("實單淨值（含成本）", "#c0392b", 2.2),
     "gross":       ("實單毛值（不含成本）", "#e67e22", 1.4),
     "D1_cost0":    ("D1 每日重排（cost0，紙上）", "#7f8c8d", 1.4),
+    "LS_cost0":    ("多空對沖 50%D1 − 50%D10（cost0）", "#8e44ad", 1.6),
     "market":      ("大盤", "#2c3e50", 1.6),
     "universe_ew": ("宇宙等權", "#16a085", 1.2),
 }
@@ -799,7 +822,7 @@ def plot_drawdown(ret_df: pd.DataFrame, output_dir: Path):
 
 
 def plot_annual(ret_df: pd.DataFrame, output_dir: Path):
-    cols = [c for c in ("net", "D1_cost0", "market") if c in ret_df.columns]
+    cols = [c for c in ("net", "D1_cost0", "LS_cost0", "market") if c in ret_df.columns]
     annual = (ret_df[cols].fillna(0) + 1).groupby(ret_df.index.year).prod() - 1
     fig, ax = plt.subplots(figsize=(13, 6))
     x = np.arange(len(annual)); width = 0.8 / len(cols)
@@ -809,7 +832,7 @@ def plot_annual(ret_df: pd.DataFrame, output_dir: Path):
     ax.set_xticks(x + width * (len(cols) - 1) / 2)
     ax.set_xticklabels(annual.index)
     ax.axhline(0, color="black", linewidth=0.8)
-    ax.set_title("逐年報酬：實單淨值 vs 紙上 D1 vs 大盤")
+    ax.set_title("逐年報酬：實單淨值 vs 紙上 D1 vs 多空對沖 vs 大盤")
     ax.set_xlabel("年"); ax.set_ylabel("報酬 (%)")
     ax.legend(); ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
@@ -883,8 +906,7 @@ def plot_yearly_panels(ret_df: pd.DataFrame, daily: pd.DataFrame, output_dir: Pa
         idx = ret_df.index[sl]
         if len(idx) < 5:
             continue
-        r_net, r_grs = ret_df.loc[sl, "net"], ret_df.loc[sl, "gross"]
-        r_mkt = ret_df.loc[sl, "market"]
+        r_net, r_mkt = ret_df.loc[sl, "net"], ret_df.loc[sl, "market"]
         st = _year_stats(r_net.dropna(), r_mkt.dropna())
 
         fig, axes = plt.subplots(
@@ -894,12 +916,15 @@ def plot_yearly_panels(ret_df: pd.DataFrame, daily: pd.DataFrame, output_dir: Pa
         ax1, ax2, ax3 = axes
 
         # ── 1. 年內累積報酬（年初歸零，年內複利） ──────────
-        for s, color, label, lw in (
-            (r_net, Y_NET, "實單淨值（含成本）", 2.0),
-            (r_grs, Y_GRS, "實單毛值（不含成本）", 1.5),
-            (r_mkt, Y_MKT, "大盤", 1.5),
+        # 超額 = 兩條年內累積曲線的差（跟 monthly_vs_market 的超額同一個口徑：
+        # 累積報酬的算術差，不是日超額的複利）
+        cum_net = (1 + r_net.fillna(0)).cumprod() - 1
+        cum_mkt = (1 + r_mkt.fillna(0)).cumprod() - 1
+        for cum, color, label, lw in (
+            (cum_net,           Y_NET, "實單淨值（含成本）", 2.0),
+            (cum_net - cum_mkt, Y_GRS, "超額（淨值 − 大盤）", 1.5),
+            (cum_mkt,           Y_MKT, "大盤", 1.5),
         ):
-            cum = (1 + s.fillna(0)).cumprod() - 1
             ax1.plot(idx, cum.values, color=color, linewidth=lw, label=label,
                      solid_capstyle="round")
             # 只在線尾直接標數字，不是每個點都標
@@ -985,7 +1010,7 @@ def main():
           f"（來回 {BUY_COST_RATE + SELL_COST_RATE:.4%}）")
     print(f"  濾網            : 金額>{MIN_AMOUNT_TO_BUY / 1e8:.0f}億={ENABLE_AMOUNT_FILTER} "
           f"漲幅<={MAX_CHG_TO_BUY:.0%}={ENABLE_CHG_FILTER} 凍結={ENABLE_STALE_FILTER} "
-          f"pred>=0={ENABLE_SCORE_FILTER} 張數={ENABLE_UNITS_FILTER} "
+          f"pred>={MIN_PRED_SCORE:g}={ENABLE_SCORE_FILTER} 張數={ENABLE_UNITS_FILTER} "
           f"群集<={CLUSTER_CAP}={ENABLE_CLUSTER_FILTER}")
     print(f"  輸出            : {OUTPUT_DIR}")
     print("  ⚠ 處置股未模擬（daily 無歷史處置清單）→ 結果偏樂觀，見檔頭說明")
@@ -1012,7 +1037,7 @@ def main():
 
     print("\n[5/5] 指標與輸出 ...")
     rows = []
-    for col in ("net", "gross", "D1_cost0", "universe_ew", "market"):
+    for col in ("net", "gross", "D1_cost0", "LS_cost0", "universe_ew", "market"):
         if col not in ret_df.columns:
             continue
         m = calc_metrics(ret_df[col], ret_df["market"] if col != "market" else None,
@@ -1079,6 +1104,8 @@ def main():
     if not monthly.empty:
         monthly.to_csv(OUTPUT_DIR / "monthly_returns.csv", encoding="utf-8-sig")
         print(f"  ✓ monthly_returns.csv（{len(monthly)} 個月）")
+    plot_monthly_distribution(ret_df, OUTPUT_DIR,
+                              strat_col="net", strat_label="實單淨值")
 
     print("\n" + "=" * 70)
     print("  績效指標")
