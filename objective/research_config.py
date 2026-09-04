@@ -144,11 +144,17 @@ class RunConfig:
     # 一起篩選後才餵給 WalkForwardTrainer（本支線為純研究/回測，無「既有持倉」
     # 概念，不像 daily_model 需區分 train-only vs. predict-all）。
     # 最佳組合來源：Optuna 搜尋 tag f3_w101004_w201896_kr02000
-    #   （D1 ann_return=151.9% / sharpe=4.38 / obj=6.66）
+    #   （D1 ann_return=151.9% / sharpe=4.38 / obj=6.66，此數字是純上市宇宙下的舊校準）
+    # ★ 2026-08-18：0.20 → 0.25（1209_otcclu 切片實驗，上市+上櫃合併宇宙）。
+    #   母體擴張後在 database_make_otc/ 上重跑 7 組 kr×k 全 12 年 walk-forward+
+    #   回測，kr=0.25 在 net Sharpe/年化報酬/ic_daily 全面優於 0.20（net Sharpe
+    #   1.782 vs 1.667），收緊到 0.10/0.15 則全面變差——與「候選池變大該收緊」
+    #   的直覺相反。clu_ 分群數 k=18 同批驗證仍是最穩健的選擇，未變動。
+    #   只有單一 seed，正式定案前建議多 seed 重跑確認；詳見 1209_otcclu/summary_otcclu.md §7。
     LIQ_FILTER_ENABLED: bool  = True
     LIQ_W1:             float = 0.1004
     LIQ_W2:             float = 0.1896
-    LIQ_KEEP_RATIO:     float = 0.20
+    LIQ_KEEP_RATIO:     float = 0.25
     # 篩選後資料快取目錄（依參數 tag 命名，非時間戳；同 tag 已存在則重用，
     # 避免每次重跑都重算，也避免殘留舊目錄造成混淆——805_group2 bug #5 教訓）
     LIQ_FILTERED_ROOT = Path("database_make_liq_filtered")
