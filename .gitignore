@@ -1,0 +1,15 @@
+# 資料與壓縮檔（過大，不進版控）
+zip/
+database/
+
+# 虛擬環境
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 作業系統
+.DS_Store
+Thumbs.db
